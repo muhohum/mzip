@@ -1,5 +1,6 @@
 #include <mzip/mzip.hpp>
 
+#include "archive.hpp"
 #include "transforms.hpp"
 
 #include <algorithm>
@@ -31,16 +32,15 @@ constexpr std::array<char, 4> archive_magic{'M', 'Z', 'I', 'P'};
 constexpr std::uint8_t archive_version = 1U;
 constexpr std::uint64_t file_header_size = 24U;
 constexpr std::uint64_t block_header_size = 24U;
+// Bit 0: payload is a tar directory tree.
+constexpr Byte archive_flag_directory = 0x01U;
 
-// Automatic block sizing: small inputs get one 4 MiB block, larger inputs one sixteenth of
-// their size, capped so files still split into enough blocks for the thread pool.
 constexpr std::uint64_t auto_block_floor = 4ULL * 1024U * 1024U;
 constexpr std::uint64_t auto_block_ceiling = 16ULL * 1024U * 1024U;
 constexpr std::uint64_t auto_block_divisor = 16U;
 
-// A worker holds the block plus suffix-array scratch, roughly 15x the block size, so the
-// number of in-flight blocks is bounded by a byte budget rather than a fixed count.
-constexpr std::uint64_t pipeline_byte_budget = 64ULL * 1024U * 1024U;
+// An in-flight block costs roughly 15x its size in scratch.
+constexpr std::uint64_t pipeline_byte_budget = 128ULL * 1024U * 1024U;
 constexpr std::uint32_t maximum_thread_count = 256U;
 constexpr std::uint32_t unique_path_attempts = 10'000U;
 
@@ -154,8 +154,6 @@ void commit_output(TemporaryFile& temporary, const std::filesystem::path& target
     {
         throw std::runtime_error("cannot inspect output path: " + status_error.message());
     }
-    // Only a regular file may be replaced. Renaming a directory, symlink, or device out of the
-    // way would rearrange things the user never asked to touch.
     if (target_status.type() != std::filesystem::file_type::regular)
     {
         throw std::runtime_error("output path exists and is not a regular file: " +
@@ -289,11 +287,12 @@ void write_bytes(std::ostream& output, const std::span<const Byte> bytes)
 }
 
 void write_file_header(std::ostream& output, const std::uint32_t block_size,
-                       const std::uint64_t original_size, const std::uint32_t block_count)
+                       const std::uint64_t original_size, const std::uint32_t block_count,
+                       const Byte flags)
 {
     output.write(archive_magic.data(), static_cast<std::streamsize>(archive_magic.size()));
     write_byte(output, archive_version);
-    write_byte(output, 0U);
+    write_byte(output, flags);
     write_u16(output, 0U);
     write_u32(output, block_size);
     write_u64(output, original_size);
@@ -351,9 +350,6 @@ void write_block_header(std::ostream& output, const BlockHeader& header)
     return static_cast<std::uint32_t>(count);
 }
 
-// A requested size of zero picks one from the input: 4 MiB up to 64 MiB inputs, then growing
-// so large files still split into enough blocks to keep the thread pool busy. The choice
-// depends only on the input size, so archives stay reproducible.
 [[nodiscard]] std::uint32_t resolve_block_size(const std::uint32_t requested,
                                                const std::uint64_t input_size)
 {
@@ -403,13 +399,9 @@ struct EncodedBlock
     Bytes bytes;
 };
 
-// Pure function of the block bytes, so it can run on any worker thread.
-// The run extension thresholds are tried one after the other, each abandoned as soon as its
-// payload can no longer beat the best size seen so far.
 constexpr std::size_t aggressive_extension_run = 2;
 constexpr std::size_t conservative_extension_run = 3;
 
-// Pure function of the block bytes, so it can run on any worker thread.
 [[nodiscard]] EncodedBlock encode_block(Bytes original)
 {
     EncodedBlock result;
@@ -466,6 +458,42 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
     increment_mode_count(stats, block.header.mode);
 }
 
+[[nodiscard]] Bytes decode_block(const BlockHeader& header, Bytes payload)
+{
+    Bytes decoded;
+    switch (header.mode)
+    {
+    case BlockMode::raw:
+        if (header.payload_size != header.original_size || header.primary_index != 0U ||
+            header.intermediate_size != 0U)
+        {
+            throw FormatError("raw block contains transform metadata");
+        }
+        decoded = std::move(payload);
+        break;
+
+    case BlockMode::transformed:
+    {
+        // Run symbols consume at least one MTF byte each.
+        if (header.primary_index == 0U || header.primary_index > header.original_size ||
+            header.intermediate_size == 0U || header.intermediate_size > header.original_size)
+        {
+            throw FormatError("invalid transformed block metadata");
+        }
+        Bytes mtf = detail::rc_decode(payload, header.intermediate_size, header.original_size);
+        payload = Bytes();
+        detail::mtf_decode(mtf);
+        decoded = detail::bwt_decode(mtf, header.primary_index);
+        break;
+    }
+    }
+    if (detail::adler32(decoded) != header.checksum)
+    {
+        throw FormatError("block checksum mismatch");
+    }
+    return decoded;
+}
+
 [[nodiscard]] std::uint32_t effective_thread_count(const std::uint32_t requested)
 {
     std::uint32_t threads = requested;
@@ -512,20 +540,44 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
         throw std::invalid_argument("input and output paths must be different");
     }
 
-    std::error_code size_error;
-    const std::uint64_t input_size = std::filesystem::file_size(input_path, size_error);
-    if (size_error)
+    std::filesystem::path source_path = input_path;
+    if (source_path.filename().empty())
     {
-        throw std::runtime_error("cannot determine input size: " + size_error.message());
+        source_path = source_path.parent_path();
+    }
+    std::error_code status_error;
+    const std::filesystem::file_status input_status =
+        std::filesystem::symlink_status(source_path, status_error);
+    if (status_error)
+    {
+        throw std::runtime_error("cannot inspect input path: " + status_error.message());
+    }
+    const bool directory_input = input_status.type() == std::filesystem::file_type::directory;
+
+    std::optional<detail::TarStreamSource> tar_source;
+    std::ifstream input;
+    std::uint64_t input_size = 0;
+    if (directory_input)
+    {
+        tar_source.emplace(source_path);
+        input_size = tar_source->total_size();
+    }
+    else
+    {
+        std::error_code size_error;
+        input_size = std::filesystem::file_size(source_path, size_error);
+        if (size_error)
+        {
+            throw std::runtime_error("cannot determine input size: " + size_error.message());
+        }
+        input.open(source_path, std::ios::binary);
+        if (!input)
+        {
+            throw std::runtime_error("cannot open input file: " + source_path.string());
+        }
     }
     const std::uint32_t block_size = resolve_block_size(options.block_size, input_size);
     const std::uint32_t block_count = expected_block_count(input_size, block_size);
-
-    std::ifstream input(input_path, std::ios::binary);
-    if (!input)
-    {
-        throw std::runtime_error("cannot open input file: " + input_path.string());
-    }
 
     TemporaryFile temporary(unique_sibling_path(output_path, ".tmp."));
     std::ofstream output(temporary.path(), std::ios::binary | std::ios::trunc);
@@ -534,7 +586,8 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
         throw std::runtime_error("cannot create output file: " + temporary.path().string());
     }
 
-    write_file_header(output, block_size, input_size, block_count);
+    write_file_header(output, block_size, input_size, block_count,
+                      directory_input ? archive_flag_directory : Byte{0U});
 
     CompressionStats stats;
     stats.input_size = input_size;
@@ -546,11 +599,28 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
         const std::size_t current_size =
             static_cast<std::size_t>(std::min<std::uint64_t>(remaining, block_size));
         original.resize(current_size);
-        input.read(reinterpret_cast<char*>(original.data()),
-                   static_cast<std::streamsize>(current_size));
-        if (input.gcount() != static_cast<std::streamsize>(current_size))
+        if (tar_source)
         {
-            throw std::runtime_error("input file changed or ended during compression");
+            std::size_t filled = 0;
+            while (filled < current_size)
+            {
+                const std::size_t produced =
+                    tar_source->read(original.data() + filled, current_size - filled);
+                if (produced == 0U)
+                {
+                    throw std::runtime_error("directory contents changed during compression");
+                }
+                filled += produced;
+            }
+        }
+        else
+        {
+            input.read(reinterpret_cast<char*>(original.data()),
+                       static_cast<std::streamsize>(current_size));
+            if (input.gcount() != static_cast<std::streamsize>(current_size))
+            {
+                throw std::runtime_error("input file changed or ended during compression");
+            }
         }
         remaining -= current_size;
     };
@@ -569,30 +639,74 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
     }
     else
     {
-        // Read in order, encode in parallel, write in order; the window bounds memory use and
-        // keeps the archive layout independent of scheduling.
-        std::deque<std::future<EncodedBlock>> in_flight;
-        for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
+        // Read in order, encode in parallel, write in order.
+        struct InFlightBlock
         {
-            if (in_flight.size() >= window)
-            {
-                write_encoded_block(output, in_flight.front().get(), stats);
-                in_flight.pop_front();
-            }
-            Bytes original;
-            read_block(original);
-            in_flight.push_back(std::async(std::launch::async,
-                                           [block = std::move(original)]() mutable
-                                           { return encode_block(std::move(block)); }));
-        }
-        while (!in_flight.empty())
+            std::thread worker;
+            std::future<EncodedBlock> result;
+        };
+        std::deque<InFlightBlock> in_flight;
+        const auto drain_front = [&]
         {
-            write_encoded_block(output, in_flight.front().get(), stats);
+            InFlightBlock front = std::move(in_flight.front());
             in_flight.pop_front();
+            front.worker.join();
+            const EncodedBlock block = front.result.get();
+            write_encoded_block(output, block, stats);
+        };
+
+        try
+        {
+            for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
+            {
+                if (in_flight.size() >= window)
+                {
+                    drain_front();
+                }
+                Bytes original;
+                read_block(original);
+                std::packaged_task<EncodedBlock()> task([block = std::move(original)]() mutable
+                                                        { return encode_block(std::move(block)); });
+                in_flight.emplace_back();
+                InFlightBlock& slot = in_flight.back();
+                slot.result = task.get_future();
+                try
+                {
+                    slot.worker = std::thread(std::move(task));
+                }
+                catch (...)
+                {
+                    in_flight.pop_back();
+                    throw;
+                }
+            }
+            while (!in_flight.empty())
+            {
+                drain_front();
+            }
+        }
+        catch (...)
+        {
+            for (InFlightBlock& block : in_flight)
+            {
+                if (block.worker.joinable())
+                {
+                    block.worker.join();
+                }
+            }
+            throw;
         }
     }
 
-    if (remaining != 0U || input.peek() != std::char_traits<char>::eof())
+    if (tar_source)
+    {
+        Byte probe = 0;
+        if (remaining != 0U || tar_source->read(&probe, 1U) != 0U)
+        {
+            throw std::runtime_error("directory contents changed during compression");
+        }
+    }
+    else if (remaining != 0U || input.peek() != std::char_traits<char>::eof())
     {
         throw std::runtime_error("input file changed during compression");
     }
@@ -616,7 +730,8 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
 }
 
 CompressionStats decompress_file(const std::filesystem::path& input_path,
-                                 const std::filesystem::path& output_path)
+                                 const std::filesystem::path& output_path,
+                                 const DecompressionOptions& options)
 {
     const auto started_at = std::chrono::steady_clock::now();
     if (paths_refer_to_same_file(input_path, output_path))
@@ -653,10 +768,11 @@ CompressionStats decompress_file(const std::filesystem::path& input_path,
     }
     const Byte flags = read_byte(input, "archive flags");
     const std::uint16_t reserved = read_u16(input, "archive flags");
-    if (flags != 0U || reserved != 0U)
+    if ((flags & static_cast<Byte>(~archive_flag_directory)) != 0U || reserved != 0U)
     {
         throw FormatError("unsupported MZIP archive flags");
     }
+    const bool directory_output = (flags & archive_flag_directory) != 0U;
 
     const std::uint32_t block_size = read_u32(input, "archive block size");
     try
@@ -683,12 +799,40 @@ CompressionStats decompress_file(const std::filesystem::path& input_path,
         throw FormatError("archive block count does not match its original size");
     }
 
-    TemporaryFile temporary(unique_sibling_path(output_path, ".tmp."));
-    std::ofstream output(temporary.path(), std::ios::binary | std::ios::trunc);
-    if (!output)
+    std::optional<TemporaryFile> temporary;
+    std::ofstream output;
+    std::optional<detail::TarExtractor> extractor;
+    std::filesystem::path staging_directory;
+    bool staging_committed = false;
+    if (directory_output)
     {
-        throw std::runtime_error("cannot create output file: " + temporary.path().string());
+        std::error_code target_error;
+        const auto target_status = std::filesystem::symlink_status(output_path, target_error);
+        if (target_status.type() != std::filesystem::file_type::not_found)
+        {
+            throw std::runtime_error("output path already exists: " + output_path.string());
+        }
+        staging_directory = unique_sibling_path(output_path, ".tmp.");
+        std::filesystem::create_directories(staging_directory);
+        extractor.emplace(staging_directory);
     }
+    else
+    {
+        temporary.emplace(unique_sibling_path(output_path, ".tmp."));
+        output.open(temporary->path(), std::ios::binary | std::ios::trunc);
+        if (!output)
+        {
+            throw std::runtime_error("cannot create output file: " + temporary->path().string());
+        }
+    }
+    const auto remove_staging = [&]
+    {
+        if (directory_output && !staging_committed)
+        {
+            std::error_code cleanup_error;
+            std::filesystem::remove_all(detail::native_long_path(staging_directory), cleanup_error);
+        }
+    };
 
     CompressionStats stats;
     stats.input_size = archive_size;
@@ -697,7 +841,7 @@ CompressionStats decompress_file(const std::filesystem::path& input_path,
     std::uint64_t remaining = original_size;
     std::uint64_t archive_remaining = archive_size - file_header_size;
 
-    for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
+    const auto read_block = [&]() -> std::pair<BlockHeader, Bytes>
     {
         if (archive_remaining < block_header_size)
         {
@@ -715,72 +859,137 @@ CompressionStats decompress_file(const std::filesystem::path& input_path,
         {
             throw FormatError("block payload size is outside the allowed range");
         }
-        // Checked against the real file size before any allocation, so declared sizes cannot
-        // make a tiny hostile archive balloon.
         if (header.payload_size > archive_remaining)
         {
             throw FormatError("block payload exceeds the archive size");
         }
         archive_remaining -= header.payload_size;
-
         Bytes payload = read_bytes(input, header.payload_size, "block payload");
-        Bytes decoded;
-        switch (header.mode)
-        {
-        case BlockMode::raw:
-            if (header.payload_size != header.original_size || header.primary_index != 0U ||
-                header.intermediate_size != 0U)
-            {
-                throw FormatError("raw block contains transform metadata");
-            }
-            decoded = std::move(payload);
-            break;
-
-        case BlockMode::transformed:
-        {
-            // A run symbol consumes at least one MTF byte, so the intermediate stream can never
-            // be longer than the block it describes.
-            if (header.primary_index == 0U || header.primary_index > header.original_size ||
-                header.intermediate_size == 0U || header.intermediate_size > header.original_size)
-            {
-                throw FormatError("invalid transformed block metadata");
-            }
-            Bytes mtf = detail::rc_decode(payload, header.intermediate_size, header.original_size);
-            payload = Bytes();
-            detail::mtf_decode(mtf);
-            decoded = detail::bwt_decode(mtf, header.primary_index);
-            break;
-        }
-        }
-
-        if (detail::adler32(decoded) != header.checksum)
-        {
-            throw FormatError("block checksum mismatch");
-        }
-        write_bytes(output, decoded);
-        if (!output)
-        {
-            throw std::runtime_error("failed while writing decompressed output");
-        }
         remaining -= header.original_size;
         increment_mode_count(stats, header.mode);
-    }
+        return {header, std::move(payload)};
+    };
 
-    if (remaining != 0U)
+    const auto write_decoded = [&](const Bytes& decoded)
     {
-        throw FormatError("archive ended before the declared original size");
-    }
-    if (input.peek() != std::char_traits<char>::eof())
-    {
-        throw FormatError("archive contains trailing data");
-    }
+        if (extractor)
+        {
+            extractor->feed(decoded);
+        }
+        else
+        {
+            write_bytes(output, decoded);
+            if (!output)
+            {
+                throw std::runtime_error("failed while writing decompressed output");
+            }
+        }
+    };
 
-    output.close();
-    if (!output)
+    try
     {
-        throw std::runtime_error("failed to finalize decompressed output");
+        const std::uint32_t thread_count = effective_thread_count(options.thread_count);
+        const std::size_t window = static_cast<std::size_t>(
+            std::clamp<std::uint64_t>(pipeline_byte_budget / block_size, 1U, thread_count));
+        if (window <= 1U || block_count <= 1U)
+        {
+            for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
+            {
+                std::pair<BlockHeader, Bytes> block = read_block();
+                write_decoded(decode_block(block.first, std::move(block.second)));
+            }
+        }
+        else
+        {
+            // Read in order, decode in parallel, write in order.
+            struct InFlightBlock
+            {
+                std::thread worker;
+                std::future<Bytes> result;
+            };
+            std::deque<InFlightBlock> in_flight;
+            const auto drain_front = [&]
+            {
+                InFlightBlock front = std::move(in_flight.front());
+                in_flight.pop_front();
+                front.worker.join();
+                const Bytes decoded = front.result.get();
+                write_decoded(decoded);
+            };
+
+            try
+            {
+                for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
+                {
+                    if (in_flight.size() >= window)
+                    {
+                        drain_front();
+                    }
+                    std::pair<BlockHeader, Bytes> block = read_block();
+                    std::packaged_task<Bytes()> task(
+                        [header = block.first, payload = std::move(block.second)]() mutable
+                        { return decode_block(header, std::move(payload)); });
+                    in_flight.emplace_back();
+                    InFlightBlock& slot = in_flight.back();
+                    slot.result = task.get_future();
+                    try
+                    {
+                        slot.worker = std::thread(std::move(task));
+                    }
+                    catch (...)
+                    {
+                        in_flight.pop_back();
+                        throw;
+                    }
+                }
+                while (!in_flight.empty())
+                {
+                    drain_front();
+                }
+            }
+            catch (...)
+            {
+                for (InFlightBlock& block : in_flight)
+                {
+                    if (block.worker.joinable())
+                    {
+                        block.worker.join();
+                    }
+                }
+                throw;
+            }
+        }
+
+        if (remaining != 0U)
+        {
+            throw FormatError("archive ended before the declared original size");
+        }
+        if (input.peek() != std::char_traits<char>::eof())
+        {
+            throw FormatError("archive contains trailing data");
+        }
+
+        if (extractor)
+        {
+            extractor->finish();
+            std::filesystem::rename(staging_directory, output_path);
+            staging_committed = true;
+        }
+        else
+        {
+            output.close();
+            if (!output)
+            {
+                throw std::runtime_error("failed to finalize decompressed output");
+            }
+            commit_output(*temporary, output_path);
+        }
     }
-    commit_output(temporary, output_path);
+    catch (...)
+    {
+        remove_staging();
+        throw;
+    }
     stats.elapsed_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
     return stats;

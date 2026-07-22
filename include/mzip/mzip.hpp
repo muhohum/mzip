@@ -19,6 +19,12 @@ struct CompressionOptions
     std::uint32_t thread_count = 0;
 };
 
+struct DecompressionOptions
+{
+    // 0 = hardware concurrency. The output does not depend on the thread count.
+    std::uint32_t thread_count = 0;
+};
+
 struct CompressionStats
 {
     std::uint64_t input_size = 0;
@@ -43,6 +49,7 @@ public:
                                              const CompressionOptions& options = {});
 
 [[nodiscard]] CompressionStats decompress_file(const std::filesystem::path& input_path,
-                                               const std::filesystem::path& output_path);
+                                               const std::filesystem::path& output_path,
+                                               const DecompressionOptions& options = {});
 
 } // namespace mzip

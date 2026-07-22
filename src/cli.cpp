@@ -21,9 +21,11 @@ void print_usage(std::ostream& output)
     output << "mzip " MZIP_VERSION " - block-sorting file compressor\n\n"
            << "Usage:\n"
            << "  mzip compress <input> <output> [--block-size <bytes>] [--threads <count>]\n"
-           << "  mzip decompress <input> <output>\n"
+           << "  mzip decompress <input> <output> [--threads <count>]\n"
            << "  mzip --help\n"
            << "  mzip --version\n\n"
+           << "The input may be a file or a directory; a directory archive extracts back into"
+              " a directory.\n"
            << "Block size: " << mzip::minimum_block_size << ".." << mzip::maximum_block_size
            << " bytes; 0 or omitted picks one from the input size.\n"
            << "Threads: 0 selects the hardware concurrency (default). Output does not depend on"
@@ -61,6 +63,28 @@ void print_usage(std::ostream& output)
         else if (flag == "--threads")
         {
             options.thread_count = parse_number(value, "thread count");
+        }
+        else
+        {
+            throw std::invalid_argument("unknown option: " + std::string{flag});
+        }
+    }
+    return options;
+}
+
+[[nodiscard]] mzip::DecompressionOptions parse_decompress_options(const int argc, char* argv[])
+{
+    mzip::DecompressionOptions options;
+    for (int index = 4; index < argc; index += 2)
+    {
+        const std::string_view flag = argv[index];
+        if (index + 1 >= argc)
+        {
+            throw std::invalid_argument("missing value after " + std::string{flag});
+        }
+        if (flag == "--threads")
+        {
+            options.thread_count = parse_number(argv[index + 1], "thread count");
         }
         else
         {
@@ -175,13 +199,14 @@ int main(const int argc, char* argv[])
 
         if (command == "decompress")
         {
-            if (argc != 4)
+            if (argc < 4 || argc > 6)
             {
                 print_usage(std::cerr);
                 return 2;
             }
+            const mzip::DecompressionOptions options = parse_decompress_options(argc, argv);
             const auto stats = mzip::decompress_file(std::filesystem::path{argv[2]},
-                                                     std::filesystem::path{argv[3]});
+                                                     std::filesystem::path{argv[3]}, options);
             print_decompression_stats(stats);
             return 0;
         }

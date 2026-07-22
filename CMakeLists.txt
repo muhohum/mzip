@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     mzip
-    VERSION 1.0.0
+    VERSION 1.1.0
     DESCRIPTION "Block-sorting lossless compressor"
     HOMEPAGE_URL "https://github.com/muhohum/mzip"
     LANGUAGES CXX
@@ -58,6 +58,7 @@ find_package(Threads REQUIRED)
 
 add_library(
     mzip_lib STATIC
+    src/archive.cpp
     src/codec.cpp
     src/transforms.cpp
 )

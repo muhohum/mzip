@@ -43,21 +43,29 @@ Linux, and macOS on the Releases page, built by CI from the tag.
 
 ```sh
 mzip compress input.txt output.mz
+mzip compress my-folder folder.mz
 mzip compress big.bin big.mz --block-size 16777216 --threads 8
 mzip decompress output.mz restored.txt
+mzip decompress folder.mz restored-folder --threads 4
 ```
+
+Directories are archived as a tar stream generated on the fly, so a folder of any size
+compresses without a temporary file; extraction validates every path and restores the tree
+atomically. Inputs of any size stream through fixed-size blocks, so memory use stays bounded
+no matter how large the file is.
 
 By default the block size is picked from the input: 4 MiB for small inputs, one sixteenth of
 the input for larger ones, capped at 16 MiB so big files always split into enough blocks to
 keep every core busy. `--block-size` (1 KiB to 64 MiB) overrides the choice; blocks above
-16 MiB compress better but give up thread-level parallelism and use more memory. `--threads 0`
-(default) uses all cores; the archive is byte-identical for any thread count. Output is
-written to a temporary file and renamed only after the whole operation succeeds.
+16 MiB compress better but give up thread-level parallelism and use more memory. Compression
+and decompression both run blocks on all cores by default (`--threads` overrides); the output
+is byte-identical for any thread count. It is written to a temporary file and renamed only
+after the whole operation succeeds.
 
 ## Using as a library
 
 The API lives in `include/mzip/mzip.hpp`: `compress_file`, `decompress_file`,
-`CompressionOptions`, `CompressionStats`, and `FormatError`. The target is `mzip::mzip`, and
+`CompressionOptions`, `DecompressionOptions`, `CompressionStats`, and `FormatError`. The target is `mzip::mzip`, and
 only the library builds when mzip is not the top-level project.
 
 Through FetchContent (or a plain `add_subdirectory`):

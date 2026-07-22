@@ -85,12 +85,13 @@ them, the decoder can only ever produce well-formed run streams.
 
 ## Parallel blocks
 
-Blocks are independent, so the compressor reads them in file order and hands them to a
-bounded pool of worker threads, draining results in the same order. A worker holds the block
-plus suffix-array scratch (roughly 15x the block size), so the number of blocks in flight
-shrinks as blocks grow, keeping peak memory near a gigabyte regardless of settings. The
+Blocks are independent, so the compressor reads them in file order and hands each in-flight
+block to a dedicated worker thread, draining results in the same order. A worker holds the
+block plus suffix-array scratch (roughly 15x the block size), so the number of blocks in
+flight shrinks as blocks grow, keeping peak memory around two gigabytes at worst. The
 archive layout never depends on scheduling: any thread count produces the same bytes.
-Decompression is currently single-threaded; the inverse BWT walk dominates its runtime.
+Decompression mirrors the same pipeline: payloads are read in archive order, decoded on
+workers, and written back in order, so the restored bytes never depend on scheduling either.
 
 ## Container format
 
@@ -101,14 +102,23 @@ allocation.
 
 File header (24 bytes):
 
-| Field            | Size | Description                      |
-|------------------|-----:|----------------------------------|
-| Magic            |    4 | ASCII `MZIP`                     |
-| Version          |    1 | `1`                              |
-| Flags + reserved |    3 | must be zero                     |
-| Block size       |    4 | maximum original bytes per block |
-| Original size    |    8 | total uncompressed size          |
-| Block count      |    4 | must match size and block size   |
+| Field            | Size | Description                                        |
+|------------------|-----:|----------------------------------------------------|
+| Magic            |    4 | ASCII `MZIP`                                       |
+| Version          |    1 | `1`                                                |
+| Flags + reserved |    3 | bit 0 of the first byte marks a directory archive; |
+|                  |      | everything else must be zero                       |
+| Block size       |    4 | maximum original bytes per block                   |
+| Original size    |    8 | total uncompressed size                            |
+| Block count      |    4 | must match size and block size                     |
+
+A directory archive's decompressed stream is a tar tree (ustar with GNU long-name entries
+and base-256 sizes where the classic fields run out) generated on the fly during
+compression, so no temporary tar ever exists on disk. Entries are sorted and carry fixed
+metadata, which keeps directory archives byte-reproducible. On extraction every stored path
+is validated - absolute paths and `..` components are rejected - and the tree is extracted
+into a temporary sibling directory that is renamed into place only when the whole archive
+checks out.
 
 Block header (24 bytes):
 
@@ -127,8 +137,8 @@ intermediate size bounds how many symbols it will produce.
 
 ## Limitations
 
-- Decompression is single-threaded and dominated by the cache-unfriendly inverse BWT, which
-  gets slower as blocks grow; ratio and decompression speed trade off through `--block-size`.
+- The inverse BWT walk is cache-unfriendly and dominates decoding time, getting slower as
+  blocks grow; ratio and decompression speed trade off through `--block-size`.
 - xz still wins on LZMA-friendly binary data with long repeated records.
 - Adler-32 catches accidental corruption, not deliberate tampering.
 - The format is versioned but only version 1 exists; no forward-compatibility promises.

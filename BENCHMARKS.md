@@ -71,5 +71,5 @@ build, Python 3.12. Total input: 13,065,681 bytes across 9 files.
   the damage.
 - The ratio comes from 4 MiB blocks and per-block adaptive modeling, and both cost speed:
   files up to a few megabytes fit in one or two blocks, so the thread pool has little to do,
-  and the coder touches every bit. On many-block inputs compression scales with cores again.
+  and the coder touches every bit. On many-block inputs both directions scale with cores again.
   `--block-size` trades ratio for speed and memory in both directions.

@@ -23,6 +23,8 @@
 
 # Generated archives and temporary output
 *.mz
+*.tar
+*.zip
 *.tmp.*
 *.backup.*
 __pycache__/

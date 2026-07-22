@@ -1,5 +1,6 @@
 #include <mzip/mzip.hpp>
 
+#include "archive.hpp"
 #include "transforms.hpp"
 
 #include <algorithm>
@@ -210,12 +211,11 @@ void test_bwt_round_trip()
         CHECK_EQ(mzip::detail::bwt_decode(encoded.data, encoded.primary_index), input);
     }
 
-    // Known answer: the sentinel-based transform of "banana" is "annbaa" with the sentinel row 4.
     const auto banana = mzip::detail::bwt_encode(to_bytes("banana"));
     CHECK_EQ(banana.data, to_bytes("annbaa"));
     CHECK_EQ(banana.primary_index, 4U);
 
-    // The primary index counts the omitted sentinel row, so its valid range is 1..size.
+    // Valid primary range is 1..size.
     expect_format_error([] { static_cast<void>(mzip::detail::bwt_decode(Bytes{1U}, 0U)); });
     expect_format_error([] { static_cast<void>(mzip::detail::bwt_decode(Bytes{1U}, 2U)); });
 }
@@ -309,10 +309,8 @@ void test_stream_codec_round_trip()
         }
     }
 
-    // A candidate that cannot fit the limit is abandoned.
     CHECK(!mzip::detail::rc_encode(random_bytes(4096U, 13U), 2U, 64U).has_value());
 
-    // Truncation, trailing bytes, wrong symbol counts, and content for an empty stream throw.
     const Bytes sample = repeated_text(5'000U);
     const auto encoded = mzip::detail::rc_encode(sample, 2U, no_limit);
     CHECK(encoded.has_value());
@@ -478,8 +476,7 @@ void test_random_corruption_is_rejected_safely()
     static_cast<void>(mzip::compress_file(source, archive, options));
     const Bytes valid = read_file(archive);
 
-    // Every damaged archive must fail with FormatError (or still decode to the exact original);
-    // crashes and silently wrong output are bugs.
+    // Damage must produce FormatError or the exact original, never a crash.
     std::mt19937 generator(20260722U);
     std::uniform_int_distribution<std::size_t> position_distribution(0U, valid.size() - 1U);
     std::uniform_int_distribution<unsigned int> bit_distribution(0U, 7U);
@@ -510,9 +507,7 @@ void test_random_corruption_is_rejected_safely()
     }
 }
 
-// Pins MZIP format version 1: the encoder must keep producing these exact bytes on every
-// platform, and the pinned bytes must keep decoding. Any change to the transforms, the model,
-// or the container is a format break and needs a version bump.
+// Format pin: any change to these bytes is a format break and needs a version bump.
 void test_golden_archive()
 {
     Bytes input;
@@ -652,7 +647,6 @@ void test_hostile_archives_are_rejected()
         CHECK_EQ(read_file(output), sentinel);
     };
 
-    // Random garbage, with and without a valid magic prefix.
     for (const std::uint32_t seed : {21U, 22U, 23U})
     {
         Bytes garbage = random_bytes(4096U, seed);
@@ -667,8 +661,7 @@ void test_hostile_archives_are_rejected()
     expect_rejected(Bytes{});
     expect_rejected(to_bytes("MZIP"));
 
-    // A tiny archive that declares maximal sizes must be rejected by the size cross-checks,
-    // not by attempting to read 64 MiB.
+    // Declared-size bombs must fail before any big allocation.
     Bytes bomb;
     const auto push_u32 = [&bomb](const std::uint32_t value)
     {
@@ -695,7 +688,7 @@ void test_hostile_archives_are_rejected()
     bomb.push_back(0U);
     expect_rejected(bomb);
 
-    // Corrupting any single header byte of a valid archive must be caught by some layer.
+    // Every header-byte flip must be caught by some layer.
     const auto source = directory.file("source.bin");
     write_file(source, repeated_text(30'000U));
     const auto valid_archive = directory.file("valid.mz");
@@ -718,6 +711,121 @@ void test_hostile_archives_are_rejected()
             CHECK_EQ(read_file(output), sentinel);
         }
     }
+}
+
+void test_directory_archive_round_trip()
+{
+    TemporaryDirectory directory;
+    const auto tree = directory.file("tree");
+    std::filesystem::create_directories(tree / "nested" / "deep");
+    std::filesystem::create_directories(tree / "empty-dir");
+    write_file(tree / "a.txt", repeated_text(3'000U));
+    write_file(tree / "empty.bin", {});
+    write_file(tree / "nested" / "deep" / "b.bin", random_bytes(5'000U, 30U));
+    const std::string long_name(180U, 'n');
+    write_file(tree / (long_name + ".txt"), to_bytes("long name content"));
+
+    const auto archive = directory.file("tree.mz");
+    const auto stats = mzip::compress_file(tree, archive);
+    CHECK(stats.input_size > 0U);
+
+    const auto archive_again = directory.file("tree2.mz");
+    static_cast<void>(mzip::compress_file(tree, archive_again));
+    CHECK_EQ(read_file(archive), read_file(archive_again));
+
+    const auto restored = directory.file("restored");
+    static_cast<void>(mzip::decompress_file(archive, restored));
+
+    const auto restored_tree = restored / "tree";
+    CHECK(std::filesystem::is_directory(restored_tree / "empty-dir"));
+    CHECK_EQ(read_file(restored_tree / "a.txt"), read_file(tree / "a.txt"));
+    CHECK_EQ(read_file(restored_tree / "empty.bin"), Bytes{});
+    CHECK_EQ(read_file(restored_tree / "nested" / "deep" / "b.bin"),
+             read_file(tree / "nested" / "deep" / "b.bin"));
+    CHECK_EQ(read_file(restored_tree / (long_name + ".txt")), to_bytes("long name content"));
+
+    std::size_t restored_count = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(restored_tree))
+    {
+        static_cast<void>(entry);
+        ++restored_count;
+    }
+    CHECK_EQ(restored_count, std::size_t{7});
+
+    bool threw = false;
+    try
+    {
+        static_cast<void>(mzip::decompress_file(archive, restored));
+    }
+    catch (const std::runtime_error&)
+    {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+void test_hostile_tar_entries_are_rejected()
+{
+    using mzip::detail::TarExtractor;
+
+    const auto make_header = [](const std::string& name)
+    {
+        Bytes block(512U, 0U);
+        std::copy(name.begin(), name.end(), block.begin());
+        const std::string size_field = "00000000000";
+        std::copy(size_field.begin(), size_field.end(), block.begin() + 124);
+        block[156] = static_cast<Byte>('0');
+        return block;
+    };
+
+    TemporaryDirectory directory;
+    const auto target = directory.file("out");
+    std::filesystem::create_directories(target);
+
+    expect_format_error(
+        [&]
+        {
+            TarExtractor extractor(target);
+            extractor.feed(make_header("../escape.txt"));
+        });
+    expect_format_error(
+        [&]
+        {
+            TarExtractor extractor(target);
+            extractor.feed(make_header("/absolute.txt"));
+        });
+    expect_format_error(
+        [&]
+        {
+            TarExtractor extractor(target);
+            extractor.feed(make_header("nested/../../escape.txt"));
+        });
+#if defined(_WIN32)
+    for (const char* name :
+         {"trailing.", "trailing ", "drive:stream.txt", "CON", "sub/NUL.txt", "LPT1"})
+    {
+        expect_format_error(
+            [&]
+            {
+                TarExtractor extractor(target);
+                extractor.feed(make_header(name));
+            });
+    }
+
+    using mzip::detail::native_long_path;
+    const std::filesystem::path local_form(LR"(\\?\C:\data\file.bin)");
+    const std::filesystem::path share_form(LR"(\\?\UNC\server\share\file)");
+    const std::filesystem::path prefixed_form(LR"(\\?\C:\already\long)");
+    CHECK_EQ(native_long_path("C:\\data\\file.bin"), local_form);
+    CHECK_EQ(native_long_path(LR"(\\server\share\file)"), share_form);
+    CHECK_EQ(native_long_path(prefixed_form), prefixed_form);
+#endif
+    expect_format_error(
+        [&]
+        {
+            TarExtractor extractor(target);
+            extractor.finish();
+        });
 }
 
 void test_thread_count_does_not_change_output()
@@ -747,6 +855,12 @@ void test_thread_count_does_not_change_output()
     const auto restored = directory.file("restored.bin");
     static_cast<void>(mzip::decompress_file(parallel_archive, restored));
     CHECK_EQ(read_file(restored), data);
+
+    mzip::DecompressionOptions sequential;
+    sequential.thread_count = 1U;
+    const auto restored_sequential = directory.file("restored-single.bin");
+    static_cast<void>(mzip::decompress_file(single_archive, restored_sequential, sequential));
+    CHECK_EQ(read_file(restored_sequential), data);
 }
 
 void test_same_input_and_output_is_rejected()
@@ -801,6 +915,8 @@ int main()
     run_test("corrupt archive handling", test_corrupt_archives_do_not_replace_output);
     run_test("random corruption safety", test_random_corruption_is_rejected_safely);
     run_test("golden archive", test_golden_archive);
+    run_test("directory archive round-trip", test_directory_archive_round_trip);
+    run_test("hostile tar entry rejection", test_hostile_tar_entries_are_rejected);
     run_test("directory output rejection", test_directory_output_is_rejected);
     run_test("hostile archive rejection", test_hostile_archives_are_rejected);
     run_test("thread count does not change output", test_thread_count_does_not_change_output);

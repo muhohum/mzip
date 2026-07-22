@@ -16,16 +16,14 @@ namespace
 
 constexpr std::size_t alphabet_size = 256;
 
-// Binary range coder in the LZMA style: 32-bit range, carry propagation through a byte cache,
-// and 12-bit adaptive probabilities with shift-based updates.
+// LZMA-style binary range coder with 12-bit adaptive probabilities.
 constexpr unsigned int probability_bits = 12;
 constexpr std::uint16_t probability_one = 1U << probability_bits;
 constexpr std::uint16_t probability_half = probability_one / 2U;
 constexpr unsigned int adaptation_shift = 5;
 constexpr std::uint32_t range_top = 1U << 24;
 
-// Sizes declared by untrusted headers are only trusted up to this much speculative allocation;
-// growth past it is amortized as usual.
+// Cap on speculative allocations driven by untrusted headers.
 constexpr std::size_t speculative_reserve_limit = std::size_t{1} << 20U;
 
 class RangeEncoder
@@ -156,9 +154,7 @@ private:
     std::uint32_t range_ = 0xFFFFFFFFU;
 };
 
-// Model geometry: run digits are conditioned on their position within a run spelling, and
-// literal bytes on the magnitude of the previous literal (exact values 1..3, a medium bucket
-// up to 15, everything else) crossed with "a zero run just ended".
+// Contexts: digit position within a run, previous-literal bucket, after-zero-run.
 constexpr unsigned int previous_class_count = 4;
 constexpr unsigned int digit_position_contexts = 4;
 constexpr unsigned int literal_bucket_count = 5;
@@ -166,8 +162,6 @@ constexpr unsigned int small_literal_max = 3;
 constexpr unsigned int medium_literal_max = 15;
 constexpr unsigned int literal_tree_size = 256;
 
-// Context model for run coding symbols. Every context is a function of already coded symbols,
-// so the decoder tracks the same state and the archive stores no model data.
 struct RunSymbolModel
 {
     enum PreviousClass : unsigned int
@@ -250,9 +244,7 @@ struct RunSymbolModel
     }
 };
 
-// SA-IS suffix array construction (Nong, Zhang, Chan, 2009). Linear time and memory. The
-// character type is 16-bit for the shifted byte alphabet at the top level and 32-bit for the
-// name alphabets of recursive calls.
+// SA-IS.
 constexpr std::uint32_t empty_slot = std::numeric_limits<std::uint32_t>::max();
 
 template <typename Char> class SuffixArraySorter
@@ -376,7 +368,6 @@ private:
         }
         induce(suffix_array);
 
-        // Scratch buffers are scoped tightly; on large blocks each one is a block-sized array.
         std::vector<std::uint32_t> lms_positions;
         std::vector<std::uint32_t> reduced_text;
         std::uint32_t name_count = 1U;
@@ -412,7 +403,6 @@ private:
             }
         }
 
-        // Recurse only when substring names repeat.
         const auto lms_count = static_cast<std::uint32_t>(lms_positions.size());
         std::vector<std::uint32_t> reduced_order;
         if (name_count == lms_count)
@@ -429,7 +419,7 @@ private:
         }
         reduced_text = std::vector<std::uint32_t>();
 
-        // Final round: place the sorted LMS suffixes and induce the complete order.
+        // Place the sorted LMS suffixes and induce the complete order.
         std::fill(suffix_array.begin(), suffix_array.end(), empty_slot);
         reset_to_bucket_tails();
         for (std::uint32_t rank = lms_count; rank-- > 0U;)
@@ -461,8 +451,7 @@ BwtResult bwt_encode(const std::span<const Byte> input)
         throw std::invalid_argument("BWT block is too large");
     }
 
-    // Byte values are shifted by one so 0 can act as the end-of-block sentinel. The shifted
-    // copy is only needed while the suffix array is being built.
+    // Values are shifted by one; 0 is the sentinel.
     std::vector<std::uint32_t> suffix_array;
     {
         std::vector<std::uint16_t> text(size + 1U);
@@ -507,9 +496,7 @@ Bytes bwt_decode(const std::span<const Byte> input, const std::uint32_t primary_
         throw FormatError("BWT primary index is outside the block");
     }
 
-    // LF-mapping inversion; the sentinel occupies row `primary_index` of the last column and
-    // row 0 of the first, hence the +1 offset in `starts`. 32-bit entries keep the table half
-    // the size, which matters in this cache-bound walk.
+    // LF-mapping inversion; the sentinel is row primary_index in L and row 0 in F.
     std::array<std::uint32_t, alphabet_size> counts{};
     std::vector<std::uint32_t> occurrence(size);
     for (std::size_t index = 0; index < size; ++index)
@@ -680,7 +667,7 @@ std::optional<EncodedStream> rc_encode(const std::span<const Byte> input,
         encode_symbol(encoder, model, symbol);
         ++symbol_count;
     };
-    // Bijective base 2, least significant digit first; runs need no terminator.
+    // Bijective base 2, least significant digit first.
     const auto emit_run_length =
         [&](std::size_t length, const Symbol digit_one, const Symbol digit_two)
     {
@@ -782,8 +769,7 @@ Bytes rc_decode(const std::span<const Byte> payload, const std::size_t symbol_co
         }
         else if (symbol <= run_d)
         {
-            // The model only offers extension bits right after a literal, so run_value is
-            // always the byte being repeated here.
+            // The model only offers extension bits right after a literal.
             run_length += symbol == run_c ? magnitude : 2U * magnitude;
             magnitude *= 2U;
             if (run_length > expected_size - output.size())
@@ -818,7 +804,7 @@ Bytes rc_decode(const std::span<const Byte> payload, const std::size_t symbol_co
 std::uint32_t adler32(const std::span<const Byte> input) noexcept
 {
     constexpr std::uint32_t modulus = 65521U;
-    // Largest run for which the 32-bit sums cannot overflow before the deferred modulo.
+    // Largest run without 32-bit overflow before the deferred modulo.
     constexpr std::size_t max_deferred = 5552U;
 
     std::uint32_t first = 1U;
