@@ -1,0 +1,5 @@
+# Normalize line endings so Windows and Linux checkouts build identically.
+* text=auto
+*.png binary
+*.zip binary
+*.mz binary

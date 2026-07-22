@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Debug, Release]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DMZIP_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >-
+          cmake -S . -B build-sanitized
+          -DCMAKE_BUILD_TYPE=Debug
+          -DMZIP_WARNINGS_AS_ERRORS=ON
+          -DMZIP_ENABLE_SANITIZERS=ON
+      - name: Build
+        run: cmake --build build-sanitized --parallel
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build-sanitized --output-on-failure
+
+  install-and-consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mzip
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          cmake --install build --prefix "$PWD/prefix"
+      - name: Build a find_package consumer
+        run: |
+          mkdir consumer && cd consumer
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(consumer CXX)
+          find_package(mzip 1.0 REQUIRED CONFIG)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE mzip::mzip)
+          EOF
+          cat > main.cpp <<'EOF'
+          #include <mzip/mzip.hpp>
+          #include <fstream>
+          #include <iostream>
+
+          int main()
+          {
+              std::ofstream("input.txt") << "mzip consumer smoke test\n";
+              const auto stats = mzip::compress_file("input.txt", "input.mz");
+              static_cast<void>(mzip::decompress_file("input.mz", "restored.txt"));
+              std::cout << "blocks: " << stats.block_count << "\n";
+              return stats.block_count == 1 ? 0 : 1;
+          }
+          EOF
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/prefix"
+          cmake --build build
+          ./build/consumer

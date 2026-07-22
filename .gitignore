@@ -1,0 +1,30 @@
+# Build outputs
+/build/
+/out/
+/benchmark-data/
+
+# IDE and editor state
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+
+# Compiler artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+*.pdb
+
+# Generated archives and temporary output
+*.mz
+*.tmp.*
+*.backup.*
+__pycache__/
+*.pyc
+
