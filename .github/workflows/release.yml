@@ -16,7 +16,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Configure
         run: >-
           cmake -S . -B build
@@ -28,7 +28,7 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
       - name: Package
         run: cpack --config build/CPackConfig.cmake -C Release -B packages
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: packages-${{ matrix.os }}
           path: |
@@ -39,7 +39,7 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: artifacts
           merge-multiple: true

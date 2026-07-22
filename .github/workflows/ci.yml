@@ -13,7 +13,7 @@ jobs:
         build_type: [Debug, Release]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Configure
         run: >-
           cmake -S . -B build
@@ -24,10 +24,27 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
 
+  linux-clang:
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DMZIP_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
   sanitizers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Configure
         run: >-
           cmake -S . -B build-sanitized
@@ -45,7 +62,7 @@ jobs:
   install-and-consume:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install mzip
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

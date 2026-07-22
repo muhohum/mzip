@@ -1,5 +1,7 @@
 # mzip
 
+[![CI](https://github.com/muhohum/mzip/actions/workflows/ci.yml/badge.svg)](https://github.com/muhohum/mzip/actions/workflows/ci.yml)
+
 A block-sorting lossless compressor in C++20. Each block goes through a Burrows-Wheeler
 transform (linear-time SA-IS suffix array), move-to-front, and run coding, then an adaptive
 binary range coder with contexts derived from the decoded state; blocks are compressed in
@@ -22,7 +24,10 @@ On the Canterbury corpora (13 MB, 9 files) mzip compresses 7.3% smaller than bzi
 
 ## Build
 
-Requires CMake 3.20+ and a C++20 compiler (CI covers MSVC, GCC, and AppleClang).
+Requires CMake 3.20+ and a C++20 compiler: GCC 11+, Clang 14+, MSVC from Visual Studio 2019
+16.11, or AppleClang 14+. There are no third-party dependencies — only the standard library
+and the system thread library. CI builds every configuration with MSVC, GCC, Clang, and
+AppleClang.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
