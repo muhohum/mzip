@@ -8,7 +8,7 @@ binary range coder with contexts derived from the decoded state; blocks are comp
 parallel and incompressible blocks are stored raw. The container format is documented and
 the decoder validates everything it reads.
 
-This is a compact personal project, not a replacement for zstd or bzip2. See
+See:
 [ALGORITHM.md](ALGORITHM.md) for how it works and [BENCHMARKS.md](BENCHMARKS.md) for
 measurements.
 
