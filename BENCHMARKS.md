@@ -13,63 +13,110 @@ python benchmarks/run_benchmark.py \
   --output benchmark-results.md
 ```
 
-All numbers are medians of five runs. mzip times include process start and file I/O; the
-reference codecs run in memory through C extension modules, which flatters their throughput
-slightly on the small files. `--threads` is forwarded to mzip (default: all cores).
+## Canterbury results
 
-## Results
+Measured 2026-07-23 on an AMD Ryzen 9 7950X (16 cores), Windows 11, MSVC 19.44 Release
+build. Total input: 13,065,681 bytes across 9 files; mzip runs with default settings.
 
-Measured 2026-07-22 on an AMD Ryzen 9 7950X (16 cores), Windows 11, MSVC 19.44 Release
-build, Python 3.12. Total input: 13,065,681 bytes across 9 files.
-
-| Codec    | Total size |  Ratio |  Compress | Decompress |
-|----------|-----------:|-------:|----------:|-----------:|
-| mzip     |  2,676,409 | 0.2048 | 13.3 MB/s |  25.9 MB/s |
-| gzip -9  |  3,591,511 | 0.2749 |  4.0 MB/s | 484.6 MB/s |
-| bzip2 -9 |  2,888,233 | 0.2211 | 24.5 MB/s |  63.2 MB/s |
-| xz -9    |  2,778,764 | 0.2127 |  4.2 MB/s | 151.4 MB/s |
-
-## Archive sizes
+| Codec    | Total size |  Ratio |
+|----------|-----------:|-------:|
+| mzip     |  2,484,577 | 0.1902 |
+| xz -9    |  2,778,764 | 0.2127 |
+| bzip2 -9 |  2,888,233 | 0.2211 |
+| gzip -9  |  3,591,511 | 0.2749 |
 
 | File         | Kind             |      Input |      mzip |   gzip -9 |  bzip2 -9 |     xz -9 |
 |--------------|------------------|-----------:|----------:|----------:|----------:|----------:|
-| alice29.txt  | English text     |    152,089 |    43,921 |    54,182 |    43,202 |    48,492 |
+| alice29.txt  | English text     |    152,089 |    40,510 |    54,182 |    43,202 |    48,492 |
 | fields.c     | C source         |     11,150 |     3,107 |     3,127 |     3,039 |     3,028 |
 | kennedy.xls  | spreadsheet      |  1,029,744 |    75,379 |   207,041 |   130,280 |    49,116 |
-| ptt5         | fax bitmap       |    513,216 |    50,878 |    52,233 |    49,759 |    41,992 |
+| ptt5         | fax bitmap       |    513,216 |    45,177 |    52,233 |    49,759 |    41,992 |
 | aaa.txt      | repeated byte    |    100,000 |        57 |       133 |        47 |       148 |
-| random.txt   | random text      |    100,000 |    76,472 |    75,747 |    75,684 |    76,824 |
-| world192.txt | CIA fact book    |  2,473,400 |   432,505 |   721,957 |   489,583 |   487,492 |
-| bible.txt    | King James Bible |  4,047,392 |   805,393 | 1,177,362 |   845,635 |   885,184 |
-| E.coli       | DNA sequence     |  4,638,690 | 1,188,697 | 1,299,729 | 1,251,004 | 1,186,488 |
-| total        |                  | 13,065,681 | 2,676,409 | 3,591,511 | 2,888,233 | 2,778,764 |
+| random.txt   | random text      |    100,000 |    75,712 |    75,747 |    75,684 |    76,824 |
+| world192.txt | CIA fact book    |  2,473,400 |   398,719 |   721,957 |   489,583 |   487,492 |
+| bible.txt    | King James Bible |  4,047,392 |   727,898 | 1,177,362 |   845,635 |   885,184 |
+| E.coli       | DNA sequence     |  4,638,690 | 1,118,018 | 1,299,729 | 1,251,004 | 1,186,488 |
+| total        |                  | 13,065,681 | 2,484,577 | 3,591,511 | 2,888,233 | 2,778,764 |
 
-## mzip timings
+## Silesia results
 
-| File         |     Input | Compress | Decompress |
-|--------------|----------:|---------:|-----------:|
-| alice29.txt  |   152,089 |  20.4 ms |    13.4 ms |
-| fields.c     |    11,150 |   9.6 ms |     9.0 ms |
-| kennedy.xls  | 1,029,744 |  51.7 ms |    31.7 ms |
-| ptt5         |   513,216 |  23.4 ms |    16.7 ms |
-| aaa.txt      |   100,000 |   8.7 ms |     8.0 ms |
-| random.txt   |   100,000 |  20.5 ms |    13.7 ms |
-| world192.txt | 2,473,400 | 154.5 ms |    75.4 ms |
-| bible.txt    | 4,047,392 | 283.9 ms |   128.8 ms |
-| E.coli       | 4,638,690 | 413.4 ms |   207.0 ms |
+The [Silesia corpus](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia) is the standard
+mixed benchmark for modern compressors: 211,938,580 bytes across 12 files of text, databases,
+executables, and images. mzip runs with `--profile ratio`; the references are the strongest
+settings of each tool (bzip2 1.0.8 `-9`, xz `-9e`, zstd 1.5.5 `--ultra -22 --long=27`,
+bzip3 1.4.0 `-b 64`, bsc 3.3 `-b64`), all on the same machine. Every Silesia file is under
+52 MB, so `-b 64` already gives bzip3 and bsc a single block per file — the same result
+their maximum block settings produce.
+
+| Codec     | Total size |  Ratio |
+|-----------|-----------:|-------:|
+| mzip      | 46,158,710 | 0.2178 |
+| bzip3     | 46,426,615 | 0.2191 |
+| bsc       | 47,088,148 | 0.2222 |
+| xz -9e    | 48,456,004 | 0.2286 |
+| zstd -22  | 52,522,343 | 0.2478 |
+| bzip2 -9  | 54,506,769 | 0.2572 |
+
+| File    | Kind            |       Input |       mzip |      bzip3 |        bsc |     xz -9e |
+|---------|-----------------|------------:|-----------:|-----------:|-----------:|-----------:|
+| dickens | English text    |  10,192,446 |  2,234,610 |  2,233,954 |  2,274,312 |  2,831,212 |
+| mozilla | executables tar |  51,220,480 | 15,814,911 | 15,832,992 | 16,107,622 | 13,376,240 |
+| mr      | MRI image       |   9,970,564 |  2,117,695 |  2,119,990 |  2,231,072 |  2,751,892 |
+| nci     | chemical db     |  33,553,445 |  1,196,019 |  1,366,363 |  1,225,348 |  1,449,272 |
+| ooffice | executable      |   6,152,192 |  2,529,406 |  2,526,882 |  2,587,452 |  2,427,224 |
+| osdb    | database        |  10,085,684 |  2,249,329 |  2,261,872 |  2,276,416 |  2,844,556 |
+| reymont | Polish text     |   6,627,202 |    982,269 |    980,475 |    993,980 |  1,315,592 |
+| samba   | source tar      |  21,606,400 |  3,905,962 |  3,918,956 |  3,968,420 |  3,739,524 |
+| sao     | star catalog    |   7,251,944 |  4,673,329 |  4,673,313 |  4,724,796 |  4,425,664 |
+| webster | dictionary      |  41,458,703 |  6,410,594 |  6,448,851 |  6,492,662 |  8,368,672 |
+| x-ray   | X-ray image     |   8,474,240 |  3,657,105 |  3,657,090 |  3,806,844 |  4,491,264 |
+| xml     | XML             |   5,345,280 |    387,481 |    405,877 |    399,224 |    434,892 |
+| total   |                 | 211,938,580 | 46,158,710 | 46,426,615 | 47,088,148 | 48,456,004 |
+
+## Versioned data
+
+Cross-block deduplication shows on versioned data. The test set is the source tree of 19
+consecutive zstd releases (v1.0.0 to v1.5.7), each `git archive` tar concatenated into one
+126,873,600-byte stream, so identical files recur up to 118 MB apart:
+
+| Codec                | Total size |  Ratio |
+|----------------------|-----------:|-------:|
+| xz -9e               |  3,388,044 | 0.0267 |
+| zstd -22 --long=30   |  3,466,573 | 0.0273 |
+| mzip --profile ratio |  3,514,113 | 0.0277 |
+| mzip (defaults)      |  3,694,471 | 0.0291 |
+| bzip3 -b 511         |  3,875,045 | 0.0305 |
+| bsc -b1000           |  4,777,094 | 0.0377 |
+
+## enwik8 and enwik9
+
+The [Large Text Compression Benchmark](https://mattmahoney.net/dc/text.html) datasets: the
+first 100 MB and 1 GB of English Wikipedia XML. `--profile ratio` covers enwik9 with a
+single 953 MiB block; bzip3 and bsc run `-b 100` / `-b 511`, and 511 MB is the largest
+block bzip3 supports:
+
+| Codec                |     enwik8 |  Ratio |      enwik9 |  Ratio |
+|----------------------|-----------:|-------:|------------:|-------:|
+| mzip --profile ratio | 20,752,546 | 0.2075 | 163,730,107 | 0.1637 |
+| bzip3                | 20,749,632 | 0.2075 | 169,990,721 | 0.1700 |
+| bsc                  | 20,944,930 | 0.2094 | 170,615,942 | 0.1706 |
+| mzip (defaults)      | 23,891,573 | 0.2389 | 198,171,513 | 0.1982 |
+| xz -9e               | 24,831,648 | 0.2483 | 211,776,220 | 0.2118 |
+| zstd -22 --long      | 25,333,695 | 0.2533 | 213,968,104 | 0.2140 |
 
 ## Reading the numbers
 
-- mzip produces the smallest total on this corpus: 7.3% smaller than bzip2 -9 and 3.7%
-  smaller than xz -9. It wins outright on structured binary data (kennedy.xls: 42% smaller
-  than bzip2), on large text (world192.txt, bible.txt), and on DNA, where the
-  previous-literal context of the range coder pays off.
-- xz keeps the lead where LZMA's match modeling shines: long repeated records (kennedy.xls
-  is still 35% smaller under xz) and ptt5.
-- Nearly incompressible data (random.txt) costs a fraction of a percent over a static coder
-  because the adaptive model has to learn that the data is random; the raw fallback bounds
-  the damage.
-- The ratio comes from 4 MiB blocks and per-block adaptive modeling, and both cost speed:
-  files up to a few megabytes fit in one or two blocks, so the thread pool has little to do,
-  and the coder touches every bit. On many-block inputs both directions scale with cores again.
-  `--block-size` trades ratio for speed and memory in both directions.
+- mzip produces the smallest Canterbury total: 13.9% below bzip2 -9 and 10.5% below xz -9.
+  Text, DNA, and the fax bitmap go to the context mixer; kennedy.xls and fields.c go to the
+  move-to-front path.
+- On Silesia mzip posts the smallest total of the six codecs. The largest wins are
+  repetitive data (nci 12% below bzip3, xml, webster, samba); dickens, reymont, sao, and
+  x-ray land within a tenth of a percent of bzip3 either way.
+- xz keeps the lead where its LZMA machinery shines: x86 executables (mozilla, ooffice —
+  mzip applies no branch-target filter) and long fixed-stride records (kennedy.xls, sao).
+- Nearly incompressible data costs almost nothing: the mixer models random text at a few
+  hundredths of a percent over its entropy, and the raw fallback bounds pathological cases.
+- Ratio still trades against speed through `--block-size`: the default keeps every core busy
+  on multi-block files, `--profile ratio` maximizes context instead. The context mixer works
+  bit by bit, so it is slower than the v1-style run coder in both directions; parallel
+  blocks absorb most of that on multi-core machines.

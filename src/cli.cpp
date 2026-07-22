@@ -20,7 +20,8 @@ void print_usage(std::ostream& output)
 {
     output << "mzip " MZIP_VERSION " - block-sorting file compressor\n\n"
            << "Usage:\n"
-           << "  mzip compress <input> <output> [--block-size <bytes>] [--threads <count>]\n"
+           << "  mzip compress <input> <output> [--block-size <bytes>] [--threads <count>]"
+              " [--profile <name>]\n"
            << "  mzip decompress <input> <output> [--threads <count>]\n"
            << "  mzip --help\n"
            << "  mzip --version\n\n"
@@ -29,7 +30,9 @@ void print_usage(std::ostream& output)
            << "Block size: " << mzip::minimum_block_size << ".." << mzip::maximum_block_size
            << " bytes; 0 or omitted picks one from the input size.\n"
            << "Threads: 0 selects the hardware concurrency (default). Output does not depend on"
-              " the thread count.\n";
+              " the thread count.\n"
+           << "Profiles: default (balanced), ratio (one block over the whole input, up to"
+              " 1 GiB; more memory).\n";
 }
 
 [[nodiscard]] std::uint32_t parse_number(const std::string_view text, const char* description)
@@ -63,6 +66,17 @@ void print_usage(std::ostream& output)
         else if (flag == "--threads")
         {
             options.thread_count = parse_number(value, "thread count");
+        }
+        else if (flag == "--profile")
+        {
+            if (value == "ratio")
+            {
+                options.profile = mzip::Profile::ratio;
+            }
+            else if (value != "default")
+            {
+                throw std::invalid_argument("unknown profile: " + std::string{value});
+            }
         }
         else
         {
@@ -185,7 +199,7 @@ int main(const int argc, char* argv[])
         const std::string_view command = argv[1];
         if (command == "compress")
         {
-            if (argc < 4 || argc > 8)
+            if (argc < 4 || argc > 10)
             {
                 print_usage(std::cerr);
                 return 2;

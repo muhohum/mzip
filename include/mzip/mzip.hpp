@@ -9,14 +9,23 @@ namespace mzip
 {
 
 inline constexpr std::uint32_t minimum_block_size = 1024U;
-inline constexpr std::uint32_t maximum_block_size = 64U * 1024U * 1024U;
+inline constexpr std::uint32_t maximum_block_size = 1024U * 1024U * 1024U;
+
+// ratio puts the whole input in one block, capped at the maximum block size. A block costs
+// about 15x its size in memory while it is being encoded.
+enum class Profile : std::uint8_t
+{
+    balanced = 0,
+    ratio = 1
+};
 
 struct CompressionOptions
 {
-    // 0 = pick a block size from the input size (larger inputs get larger blocks).
+    // 0 = pick a block size from the input size and profile.
     std::uint32_t block_size = 0;
     // 0 = hardware concurrency. The archive does not depend on the thread count.
     std::uint32_t thread_count = 0;
+    Profile profile = Profile::balanced;
 };
 
 struct DecompressionOptions

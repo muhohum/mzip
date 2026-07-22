@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     mzip
-    VERSION 1.1.0
+    VERSION 2.0.0
     DESCRIPTION "Block-sorting lossless compressor"
     HOMEPAGE_URL "https://github.com/muhohum/mzip"
     LANGUAGES CXX

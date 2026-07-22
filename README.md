@@ -2,25 +2,35 @@
 
 [![CI](https://github.com/muhohum/mzip/actions/workflows/ci.yml/badge.svg)](https://github.com/muhohum/mzip/actions/workflows/ci.yml)
 
-A block-sorting lossless compressor in C++20. Each block goes through a Burrows-Wheeler
-transform (linear-time SA-IS suffix array), move-to-front, and run coding, then an adaptive
-binary range coder with contexts derived from the decoded state; blocks are compressed in
-parallel and incompressible blocks are stored raw. The container format is documented and
-the decoder validates everything it reads.
+A block-sorting lossless compressor in C++20. Multi-block inputs first pass through a
+stream-wide LZP stage that collapses long repeats between distant blocks. Each block then
+goes through an optional LZP pass and a Burrows-Wheeler transform (linear-time SA-IS suffix
+array), and whichever of two coders yields fewer bytes: a context-mixing arithmetic coder
+over the BWT output, or move-to-front with run coding under an adaptive range coder. Blocks
+are compressed and decompressed in parallel, incompressible blocks are stored raw, the
+container format is documented, and the decoder validates everything it reads.
 
 See:
 [ALGORITHM.md](ALGORITHM.md) for how it works and [BENCHMARKS.md](BENCHMARKS.md) for
 measurements.
 
-On the Canterbury corpora (13 MB, 9 files) mzip compresses 7.3% smaller than bzip2 -9 and
-3.7% smaller than xz -9:
+On the Canterbury corpora (13 MB, 9 files) mzip compresses 13.9% smaller than bzip2 -9 and
+10.5% smaller than xz -9; on the Silesia corpus (212 MB) and on enwik9 (1 GB of Wikipedia)
+with `--profile ratio` it comes out ahead of bzip3 and bsc, the strongest block-sorting
+compressors in the comparison:
 
-| Codec    |  Ratio |  Compress | Decompress |
-|----------|-------:|----------:|-----------:|
-| mzip     | 0.2048 | 13.3 MB/s |  25.9 MB/s |
-| gzip -9  | 0.2749 |  4.0 MB/s | 484.6 MB/s |
-| bzip2 -9 | 0.2211 | 24.5 MB/s |  63.2 MB/s |
-| xz -9    | 0.2127 |  4.2 MB/s | 151.4 MB/s |
+| Codec    | Canterbury | Silesia | enwik9 |
+|----------|-----------:|--------:|-------:|
+| mzip     |     0.1902 |  0.2178 | 0.1637 |
+| bzip3    |          - |  0.2191 | 0.1700 |
+| bsc      |          - |  0.2222 | 0.1706 |
+| xz -9e   |     0.2127 |  0.2286 | 0.2118 |
+| zstd -22 |          - |  0.2478 | 0.2140 |
+| bzip2 -9 |     0.2211 |  0.2572 |      - |
+| gzip -9  |     0.2749 |       - |      - |
+
+Per-file tables, enwik8, and a versioned-data benchmark are in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Build
 
@@ -44,6 +54,7 @@ Linux, and macOS on the Releases page, built by CI from the tag.
 ```sh
 mzip compress input.txt output.mz
 mzip compress my-folder folder.mz
+mzip compress big.bin big.mz --profile ratio
 mzip compress big.bin big.mz --block-size 16777216 --threads 8
 mzip decompress output.mz restored.txt
 mzip decompress folder.mz restored-folder --threads 4
@@ -51,16 +62,17 @@ mzip decompress folder.mz restored-folder --threads 4
 
 Directories are archived as a tar stream generated on the fly, so a folder of any size
 compresses without a temporary file; extraction validates every path and restores the tree
-atomically. Inputs of any size stream through fixed-size blocks, so memory use stays bounded
-no matter how large the file is.
+atomically. Inputs up to 512 MiB are buffered whole for the deduplication stage; larger
+inputs stream through fixed-size blocks with bounded memory.
 
 By default the block size is picked from the input: 4 MiB for small inputs, one sixteenth of
 the input for larger ones, capped at 16 MiB so big files always split into enough blocks to
-keep every core busy. `--block-size` (1 KiB to 64 MiB) overrides the choice; blocks above
-16 MiB compress better but give up thread-level parallelism and use more memory. Compression
-and decompression both run blocks on all cores by default (`--threads` overrides); the output
-is byte-identical for any thread count. It is written to a temporary file and renamed only
-after the whole operation succeeds.
+keep every core busy. `--profile ratio` puts the whole input in one block (up to 1 GiB)
+instead — the best compression at the cost of parallelism and memory — and `--block-size`
+(1 KiB to 1 GiB) sets anything else; a block costs roughly 15x its size in memory while it
+is being encoded. Compression and decompression both run blocks on all cores by default
+(`--threads` overrides); the output is byte-identical for any thread count. It is written to
+a temporary file and renamed only after the whole operation succeeds.
 
 ## Using as a library
 
@@ -72,7 +84,7 @@ Through FetchContent (or a plain `add_subdirectory`):
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(mzip GIT_REPOSITORY https://github.com/muhohum/mzip.git GIT_TAG v1.0.0)
+FetchContent_Declare(mzip GIT_REPOSITORY https://github.com/muhohum/mzip.git GIT_TAG v2.0.0)
 FetchContent_MakeAvailable(mzip)
 target_link_libraries(app PRIVATE mzip::mzip)
 ```
@@ -80,7 +92,7 @@ target_link_libraries(app PRIVATE mzip::mzip)
 Or against an installed copy:
 
 ```cmake
-find_package(mzip 1.0 REQUIRED CONFIG)
+find_package(mzip 2.0 REQUIRED CONFIG)
 target_link_libraries(app PRIVATE mzip::mzip)
 ```
 

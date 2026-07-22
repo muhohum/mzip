@@ -47,6 +47,17 @@ rc_encode(std::span<const Byte> input, std::size_t min_extension_run, std::size_
 [[nodiscard]] Bytes rc_decode(std::span<const Byte> payload, std::size_t symbol_count,
                               std::size_t expected_size);
 
+// Context-mixing coder over raw BWT output; returns nothing once the payload reaches size_limit.
+[[nodiscard]] std::optional<Bytes> cm_encode(std::span<const Byte> input, std::size_t size_limit);
+[[nodiscard]] Bytes cm_decode(std::span<const Byte> payload, std::size_t expected_size);
+
+// LZP: long repeats become marker+length tokens; the stream starts with the marker byte.
+// Encode returns nothing unless the stream shrinks; hash_bits sizes the shared table.
+[[nodiscard]] std::optional<Bytes> lzp_encode(std::span<const Byte> input,
+                                              unsigned int hash_bits = 20U);
+[[nodiscard]] Bytes lzp_decode(std::span<const Byte> input, std::size_t expected_size,
+                               unsigned int hash_bits = 20U);
+
 [[nodiscard]] std::uint32_t adler32(std::span<const Byte> input) noexcept;
 
 } // namespace mzip::detail

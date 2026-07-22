@@ -265,6 +265,136 @@ void test_mtf_round_trip()
     }
 }
 
+void test_cm_and_lzp_round_trip()
+{
+    const std::vector<Bytes> cases{to_bytes("banana"), repeated_text(5'000U),
+                                   random_bytes(4'096U, 11U), Bytes(2'000U, 0U)};
+    for (const Bytes& input : cases)
+    {
+        const auto coded = mzip::detail::cm_encode(input, input.size() * 2U + 64U);
+        CHECK(coded.has_value());
+        CHECK_EQ(mzip::detail::cm_decode(*coded, input.size()), input);
+    }
+
+    std::mt19937 generator(20260723U);
+    std::uniform_int_distribution<std::size_t> size_distribution(0U, 2'000U);
+    std::uniform_int_distribution<unsigned int> byte_distribution(0U, 255U);
+    std::uniform_int_distribution<std::size_t> run_distribution(1U, 200U);
+    for (unsigned int round = 0; round < 300U; ++round)
+    {
+        Bytes input(size_distribution(generator));
+        const unsigned int shape = round % 4U;
+        std::size_t index = 0;
+        while (index < input.size())
+        {
+            if (shape == 0U)
+            {
+                input[index++] = static_cast<Byte>(byte_distribution(generator));
+            }
+            else if (shape == 1U)
+            {
+                const Byte value = static_cast<Byte>(byte_distribution(generator));
+                std::size_t run = run_distribution(generator);
+                while (run-- > 0U && index < input.size())
+                {
+                    input[index++] = value;
+                }
+            }
+            else if (shape == 2U)
+            {
+                input[index] = static_cast<Byte>((index & 1U) == 0U ? 0x00U : 0xFFU);
+                ++index;
+            }
+            else
+            {
+                input[index] = static_cast<Byte>(index & 0xFFU);
+                ++index;
+            }
+        }
+        const auto coded = mzip::detail::cm_encode(input, input.size() * 2U + 64U);
+        CHECK(coded.has_value());
+        CHECK_EQ(mzip::detail::cm_decode(*coded, input.size()), input);
+    }
+
+    const Bytes sample = repeated_text(3'000U);
+    const auto full = mzip::detail::cm_encode(sample, sample.size());
+    CHECK(full.has_value());
+    for (const std::size_t cut :
+         {std::size_t{0}, std::size_t{1}, std::size_t{3}, full->size() - 1U})
+    {
+        expect_format_error(
+            [&]
+            {
+                static_cast<void>(mzip::detail::cm_decode(std::span<const Byte>(full->data(), cut),
+                                                          sample.size()));
+            });
+    }
+
+    Bytes repetitive = random_bytes(600U, 21U);
+    const Bytes chunk = repetitive;
+    for (int copy = 0; copy < 6; ++copy)
+    {
+        repetitive.insert(repetitive.end(), chunk.begin(), chunk.end());
+    }
+    const auto stream = mzip::detail::lzp_encode(repetitive);
+    CHECK(stream.has_value());
+    CHECK(stream->size() < repetitive.size());
+    CHECK_EQ(mzip::detail::lzp_decode(*stream, repetitive.size()), repetitive);
+
+    CHECK(!mzip::detail::lzp_encode(random_bytes(4'096U, 22U)).has_value());
+}
+
+void test_stream_lzp_round_trip()
+{
+    const Bytes chunk = random_bytes(3'000U, 33U);
+    Bytes data;
+    for (unsigned int copy = 0; copy < 8U; ++copy)
+    {
+        data.insert(data.end(), chunk.begin(), chunk.end());
+        const Bytes separator = random_bytes(500U, 40U + copy);
+        data.insert(data.end(), separator.begin(), separator.end());
+    }
+
+    TemporaryDirectory directory;
+    const auto source = directory.file("versions.bin");
+    write_file(source, data);
+    mzip::CompressionOptions options;
+    options.block_size = 1024U;
+    const auto archive = directory.file("versions.mz");
+    const auto stats = mzip::compress_file(source, archive, options);
+    CHECK(stats.output_size < data.size() / 2U);
+
+    const auto restored = directory.file("versions.out");
+    static_cast<void>(mzip::decompress_file(archive, restored));
+    CHECK_EQ(read_file(restored), data);
+
+    mzip::DecompressionOptions sequential;
+    sequential.thread_count = 1U;
+    const auto restored_single = directory.file("versions-single.out");
+    static_cast<void>(mzip::decompress_file(archive, restored_single, sequential));
+    CHECK_EQ(read_file(restored_single), data);
+
+    mzip::CompressionOptions whole;
+    whole.profile = mzip::Profile::ratio;
+    const auto whole_archive = directory.file("whole.mz");
+    const auto whole_stats = mzip::compress_file(source, whole_archive, whole);
+    CHECK_EQ(whole_stats.block_count, 1U);
+    const auto whole_restored = directory.file("whole.out");
+    static_cast<void>(mzip::decompress_file(whole_archive, whole_restored));
+    CHECK_EQ(read_file(whole_restored), data);
+
+    const auto tree = directory.file("tree");
+    std::filesystem::create_directories(tree);
+    write_file(tree / "a.bin", data);
+    write_file(tree / "b.bin", data);
+    const auto tree_archive = directory.file("tree.mz");
+    static_cast<void>(mzip::compress_file(tree, tree_archive, options));
+    const auto tree_restored = directory.file("tree-out");
+    static_cast<void>(mzip::decompress_file(tree_archive, tree_restored));
+    CHECK_EQ(read_file(tree_restored / "tree" / "a.bin"), data);
+    CHECK_EQ(read_file(tree_restored / "tree" / "b.bin"), data);
+}
+
 void test_stream_codec_round_trip()
 {
     Bytes boundaries;
@@ -528,7 +658,37 @@ void test_golden_archive()
     }
     input.resize(2600U);
 
-    static const unsigned char golden[] = {
+    static const unsigned char golden_v2[] = {
+        0x4DU, 0x5AU, 0x49U, 0x50U, 0x02U, 0x02U, 0x00U, 0x00U, 0x00U, 0x04U, 0x00U, 0x00U, 0x28U,
+        0x0AU, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x01U, 0x00U, 0x00U, 0x00U, 0x7EU, 0x01U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0xE4U, 0x90U, 0xB6U, 0x1EU, 0x14U, 0x00U, 0x00U,
+        0x00U, 0x02U, 0x00U, 0x00U, 0x00U, 0x7EU, 0x01U, 0x00U, 0x00U, 0x29U, 0x01U, 0x00U, 0x00U,
+        0x79U, 0x01U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x12U, 0xADU, 0xA1U, 0x37U, 0xFDU,
+        0xFAU, 0x22U, 0x2EU, 0xEBU, 0xFFU, 0x4EU, 0x29U, 0xDEU, 0x65U, 0x4EU, 0x33U, 0x6BU, 0x36U,
+        0x85U, 0xD0U, 0x7AU, 0xB4U, 0x54U, 0xB7U, 0x9FU, 0x38U, 0x06U, 0x23U, 0xFCU, 0x7EU, 0x2AU,
+        0xE7U, 0xADU, 0x59U, 0x80U, 0x50U, 0x58U, 0xC8U, 0xC7U, 0xFEU, 0x62U, 0xEFU, 0x99U, 0x83U,
+        0x1DU, 0x8DU, 0x38U, 0x07U, 0x2CU, 0x75U, 0x14U, 0x64U, 0x3FU, 0x45U, 0xB8U, 0x2BU, 0x65U,
+        0x50U, 0x7BU, 0x16U, 0xD3U, 0xE5U, 0xD8U, 0x94U, 0xD6U, 0xF6U, 0xFDU, 0x0DU, 0xC2U, 0x5EU,
+        0x79U, 0xB0U, 0xA3U, 0xE9U, 0x07U, 0x12U, 0x5FU, 0x18U, 0xD9U, 0xCFU, 0x86U, 0x17U, 0x43U,
+        0x0DU, 0xAAU, 0xF1U, 0x91U, 0xD1U, 0x4AU, 0xFEU, 0xA5U, 0x08U, 0x3CU, 0x9DU, 0xC7U, 0xCCU,
+        0x93U, 0x0FU, 0xD8U, 0xABU, 0x38U, 0xF5U, 0x64U, 0xA7U, 0xE8U, 0x68U, 0x68U, 0xD8U, 0x7AU,
+        0xBAU, 0xA0U, 0x16U, 0x71U, 0x58U, 0xC5U, 0x54U, 0x46U, 0x66U, 0xD3U, 0x54U, 0xA5U, 0x91U,
+        0x0AU, 0x3EU, 0x83U, 0x04U, 0xA3U, 0x12U, 0xAEU, 0x87U, 0xEBU, 0x3CU, 0x2DU, 0x00U, 0xC6U,
+        0xB6U, 0x55U, 0xFEU, 0xD7U, 0xC7U, 0xCAU, 0x05U, 0x5CU, 0x49U, 0xB4U, 0x72U, 0x52U, 0xCDU,
+        0x3AU, 0xB7U, 0x94U, 0x50U, 0xC5U, 0x36U, 0xE5U, 0xA8U, 0xEDU, 0x97U, 0x15U, 0x5AU, 0xAEU,
+        0x70U, 0x3BU, 0x19U, 0xBAU, 0xA6U, 0x6FU, 0x86U, 0x4BU, 0xFAU, 0x80U, 0xD8U, 0xADU, 0xCAU,
+        0xFEU, 0xB2U, 0x7BU, 0xF3U, 0x60U, 0x81U, 0xC0U, 0x05U, 0x66U, 0x87U, 0x2DU, 0xC5U, 0x0DU,
+        0x80U, 0x8BU, 0xB8U, 0x03U, 0xB5U, 0xCFU, 0x7EU, 0x61U, 0xE0U, 0x34U, 0xFEU, 0x43U, 0x54U,
+        0x55U, 0x78U, 0x94U, 0x3FU, 0x89U, 0x9FU, 0xAFU, 0x03U, 0x25U, 0x1EU, 0xA8U, 0x5FU, 0x56U,
+        0x09U, 0x8FU, 0x56U, 0x9BU, 0x08U, 0x56U, 0xBFU, 0x41U, 0x4DU, 0x86U, 0x48U, 0x40U, 0x6FU,
+        0xA5U, 0x79U, 0xCAU, 0x13U, 0x8EU, 0x6FU, 0x8DU, 0xBAU, 0xD5U, 0x25U, 0x7AU, 0xC7U, 0xD4U,
+        0x5AU, 0x0CU, 0x0DU, 0x1DU, 0x25U, 0x3CU, 0x32U, 0xE7U, 0xF6U, 0x50U, 0x97U, 0x1BU, 0x6EU,
+        0xF2U, 0x7FU, 0xA5U, 0x2AU, 0x11U, 0x16U, 0xDDU, 0xABU, 0x90U, 0x06U, 0x56U, 0x19U, 0x55U,
+        0xE1U, 0xEBU, 0x80U, 0x08U, 0xA8U, 0x86U, 0x9FU, 0xD3U, 0xDFU, 0xB5U, 0xFDU, 0xDDU, 0xFFU,
+        0x10U, 0x30U, 0xFCU, 0x8EU, 0xA1U, 0x0DU, 0x1EU, 0x39U, 0x93U, 0x1CU, 0xAAU, 0xB3U, 0xDBU,
+        0x03U, 0xBAU, 0x13U, 0xBAU, 0x1BU, 0x86U, 0x95U, 0x47U, 0x17U, 0x65U};
+
+    static const unsigned char golden_v1[] = {
         0x4DU, 0x5AU, 0x49U, 0x50U, 0x01U, 0x00U, 0x00U, 0x00U, 0x00U, 0x04U, 0x00U, 0x00U, 0x28U,
         0x0AU, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x03U, 0x00U, 0x00U, 0x00U, 0x01U, 0x00U,
         0x00U, 0x00U, 0x00U, 0x04U, 0x00U, 0x00U, 0x35U, 0x00U, 0x00U, 0x00U, 0xC0U, 0x01U, 0x00U,
@@ -574,7 +734,8 @@ void test_golden_archive()
         0xEBU, 0x77U, 0x88U, 0x6CU, 0xE2U, 0x40U, 0x2BU, 0x2DU, 0xE1U, 0x7FU, 0x30U, 0x44U, 0xD3U,
         0x7AU, 0xFAU, 0xB8U, 0xD0U, 0x79U, 0x83U, 0x92U, 0xE7U, 0xEDU, 0xF0U, 0x46U, 0x44U, 0x16U,
         0x80U, 0xD9U, 0xF2U, 0x90U, 0x34U, 0x98U};
-    const Bytes expected(golden, golden + sizeof(golden));
+    const Bytes expected(golden_v2, golden_v2 + sizeof(golden_v2));
+    const Bytes legacy(golden_v1, golden_v1 + sizeof(golden_v1));
 
     TemporaryDirectory directory;
     const auto source = directory.file("golden.bin");
@@ -591,6 +752,13 @@ void test_golden_archive()
     const auto restored = directory.file("restored.bin");
     static_cast<void>(mzip::decompress_file(pinned, restored));
     CHECK_EQ(read_file(restored), input);
+
+    // Version 1 archives stay readable.
+    const auto pinned_v1 = directory.file("pinned-v1.mz");
+    write_file(pinned_v1, legacy);
+    const auto restored_v1 = directory.file("restored-v1.bin");
+    static_cast<void>(mzip::decompress_file(pinned_v1, restored_v1));
+    CHECK_EQ(read_file(restored_v1), input);
 }
 
 void test_directory_output_is_rejected()
@@ -910,6 +1078,8 @@ int main()
     run_test("BWT randomized round-trip", test_bwt_randomized);
     run_test("MTF round-trip", test_mtf_round_trip);
     run_test("stream codec round-trip", test_stream_codec_round_trip);
+    run_test("context mixer and LZP round-trip", test_cm_and_lzp_round_trip);
+    run_test("stream LZP round-trip", test_stream_lzp_round_trip);
     run_test("file round-trip and determinism", test_file_round_trip_and_determinism);
     run_test("block mode selection", test_block_mode_selection);
     run_test("corrupt archive handling", test_corrupt_archives_do_not_replace_output);

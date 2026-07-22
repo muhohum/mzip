@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace mzip::detail
 {
@@ -244,7 +246,6 @@ struct RunSymbolModel
     }
 };
 
-// SA-IS.
 constexpr std::uint32_t empty_slot = std::numeric_limits<std::uint32_t>::max();
 
 template <typename Char> class SuffixArraySorter
@@ -797,6 +798,412 @@ Bytes rc_decode(const std::span<const Byte> payload, const std::size_t symbol_co
     if (decoder.position() != payload.size())
     {
         throw FormatError("range-coded stream contains trailing bytes");
+    }
+    return output;
+}
+
+namespace
+{
+
+constexpr std::uint16_t cm_half = 1U << 15U;
+constexpr unsigned int cm_apm_columns = 17;
+
+void cm_toward_one(std::uint16_t& probability, const unsigned int shift)
+{
+    probability = static_cast<std::uint16_t>(probability + ((probability ^ 0xFFFFU) >> shift));
+}
+
+void cm_toward_zero(std::uint16_t& probability, const unsigned int shift)
+{
+    probability = static_cast<std::uint16_t>(probability - (probability >> shift));
+}
+
+// Order-0 and two order-1 counters mixed 7:7:2, then an adaptive map per tree node.
+struct CmModel
+{
+    std::vector<std::uint16_t> order0;
+    std::vector<std::uint16_t> order1;
+    std::vector<std::uint16_t> apm;
+    unsigned int previous = 0;
+    unsigned int before_previous = 0;
+    unsigned int run = 0;
+
+    CmModel() : order0(256U, cm_half), order1(256U * 256U, cm_half), apm(512U * cm_apm_columns)
+    {
+        for (unsigned int row = 0; row < 512U; ++row)
+        {
+            for (unsigned int step = 0; step < cm_apm_columns; ++step)
+            {
+                apm[row * cm_apm_columns + step] =
+                    static_cast<std::uint16_t>((step << 12U) - (step == 16U ? 1U : 0U));
+            }
+        }
+    }
+
+    struct Slots
+    {
+        std::uint16_t* zero_order;
+        std::uint16_t* first_order;
+        std::uint16_t* map_low;
+        std::uint16_t* map_high;
+        std::uint32_t scaled;
+    };
+
+    [[nodiscard]] Slots predict(const unsigned int node, const unsigned int run_flag)
+    {
+        Slots slots{};
+        slots.zero_order = &order0[node];
+        slots.first_order = &order1[previous * 256U + node];
+        const std::uint32_t mixed =
+            ((static_cast<std::uint32_t>(*slots.zero_order) + *slots.first_order) * 7U +
+             2U * order1[before_previous * 256U + node]) >>
+            4U;
+        std::uint16_t* row = &apm[(node * 2U + run_flag) * cm_apm_columns];
+        slots.map_low = row + (mixed >> 12U);
+        slots.map_high = slots.map_low + 1U;
+        const int left = *slots.map_low;
+        const int right = *slots.map_high;
+        const int interpolated = left + (((right - left) * static_cast<int>(mixed & 4095U)) >> 12);
+        slots.scaled = static_cast<std::uint32_t>(interpolated * 3 + static_cast<int>(mixed));
+        return slots;
+    }
+
+    void update(const Slots& slots, const unsigned int bit)
+    {
+        if (bit != 0U)
+        {
+            cm_toward_one(*slots.zero_order, 2U);
+            cm_toward_one(*slots.first_order, 4U);
+            cm_toward_one(*slots.map_low, 6U);
+            cm_toward_one(*slots.map_high, 6U);
+        }
+        else
+        {
+            cm_toward_zero(*slots.zero_order, 2U);
+            cm_toward_zero(*slots.first_order, 4U);
+            cm_toward_zero(*slots.map_low, 6U);
+            cm_toward_zero(*slots.map_high, 6U);
+        }
+    }
+
+    [[nodiscard]] unsigned int run_flag() noexcept
+    {
+        if (previous == before_previous)
+        {
+            ++run;
+        }
+        else
+        {
+            run = 0;
+        }
+        return run > 2U ? 1U : 0U;
+    }
+
+    void advance(const unsigned int byte) noexcept
+    {
+        before_previous = previous;
+        previous = byte;
+    }
+};
+
+constexpr std::size_t lzp_min_match = 128;
+constexpr std::size_t lzp_context_size = 8;
+
+[[nodiscard]] std::uint32_t lzp_slot(const std::uint64_t context,
+                                     const unsigned int hash_bits) noexcept
+{
+    return static_cast<std::uint32_t>((context * 0x9E3779B97F4A7C15ULL) >> (64U - hash_bits));
+}
+
+void lzp_put_length(Bytes& output, std::size_t value)
+{
+    while (value >= 128U)
+    {
+        output.push_back(static_cast<Byte>((value & 127U) | 128U));
+        value >>= 7U;
+    }
+    output.push_back(static_cast<Byte>(value));
+}
+
+} // namespace
+
+std::optional<Bytes> cm_encode(const std::span<const Byte> input, const std::size_t size_limit)
+{
+    Bytes output;
+    output.reserve(std::min(size_limit, input.size() / 2U + 64U));
+    const auto model = std::make_unique<CmModel>();
+    std::uint32_t low = 0;
+    std::uint32_t high = 0xFFFFFFFFU;
+
+    for (const Byte value : input)
+    {
+        const unsigned int flag = model->run_flag();
+        unsigned int node = 1;
+        for (unsigned int shift = 8U; shift-- > 0U;)
+        {
+            const unsigned int bit = (value >> shift) & 1U;
+            const CmModel::Slots slots = model->predict(node, flag);
+            const std::uint32_t mid =
+                low + static_cast<std::uint32_t>(
+                          (static_cast<std::uint64_t>(high - low) * slots.scaled) >> 18U);
+            if (bit != 0U)
+            {
+                high = mid;
+            }
+            else
+            {
+                low = mid + 1U;
+            }
+            while (((low ^ high) & 0xFF000000U) == 0U)
+            {
+                output.push_back(static_cast<Byte>(low >> 24U));
+                low <<= 8U;
+                high = (high << 8U) | 0xFFU;
+            }
+            model->update(slots, bit);
+            node = node * 2U + bit;
+        }
+        model->advance(node & 255U);
+        if (output.size() > size_limit)
+        {
+            return std::nullopt;
+        }
+    }
+    for (int iteration = 0; iteration < 4; ++iteration)
+    {
+        output.push_back(static_cast<Byte>(low >> 24U));
+        low <<= 8U;
+    }
+    if (output.size() > size_limit)
+    {
+        return std::nullopt;
+    }
+    return output;
+}
+
+Bytes cm_decode(const std::span<const Byte> payload, const std::size_t expected_size)
+{
+    Bytes output;
+    output.reserve(expected_size);
+    const auto model = std::make_unique<CmModel>();
+    std::uint32_t low = 0;
+    std::uint32_t high = 0xFFFFFFFFU;
+    std::uint32_t code = 0;
+    std::size_t position = 0;
+    const auto next_byte = [&]() -> std::uint32_t
+    {
+        if (position >= payload.size())
+        {
+            throw FormatError("truncated mixed payload");
+        }
+        return payload[position++];
+    };
+
+    for (int iteration = 0; iteration < 4; ++iteration)
+    {
+        code = (code << 8U) | next_byte();
+    }
+    for (std::size_t index = 0; index < expected_size; ++index)
+    {
+        const unsigned int flag = model->run_flag();
+        unsigned int node = 1;
+        for (unsigned int shift = 8U; shift-- > 0U;)
+        {
+            const CmModel::Slots slots = model->predict(node, flag);
+            const std::uint32_t mid =
+                low + static_cast<std::uint32_t>(
+                          (static_cast<std::uint64_t>(high - low) * slots.scaled) >> 18U);
+            const unsigned int bit = code <= mid ? 1U : 0U;
+            if (bit != 0U)
+            {
+                high = mid;
+            }
+            else
+            {
+                low = mid + 1U;
+            }
+            while (((low ^ high) & 0xFF000000U) == 0U)
+            {
+                low <<= 8U;
+                high = (high << 8U) | 0xFFU;
+                code = (code << 8U) | next_byte();
+            }
+            model->update(slots, bit);
+            node = node * 2U + bit;
+        }
+        const unsigned int byte = node & 255U;
+        model->advance(byte);
+        output.push_back(static_cast<Byte>(byte));
+    }
+    if (position != payload.size())
+    {
+        throw FormatError("mixed payload contains trailing bytes");
+    }
+    return output;
+}
+
+std::optional<Bytes> lzp_encode(const std::span<const Byte> input, const unsigned int hash_bits)
+{
+    if (input.size() <= lzp_min_match + lzp_context_size)
+    {
+        return std::nullopt;
+    }
+    std::array<std::size_t, 256> frequency{};
+    for (const Byte value : input)
+    {
+        ++frequency[value];
+    }
+    Byte marker = 0;
+    for (unsigned int value = 1; value < 256U; ++value)
+    {
+        if (frequency[value] < frequency[marker])
+        {
+            marker = static_cast<Byte>(value);
+        }
+    }
+
+    Bytes output;
+    output.reserve(input.size());
+    output.push_back(marker);
+    std::vector<std::uint32_t> table(std::size_t{1} << hash_bits, 0U);
+    std::uint64_t context = 0;
+    const std::size_t total = input.size();
+    std::size_t index = 0;
+    while (index < total)
+    {
+        std::uint32_t predicted = 0;
+        if (index >= lzp_context_size)
+        {
+            const std::uint32_t slot = lzp_slot(context, hash_bits);
+            predicted = table[slot];
+            table[slot] = static_cast<std::uint32_t>(index) + 1U;
+        }
+        if (predicted != 0U)
+        {
+            const std::size_t source = predicted - 1U;
+            std::size_t match = 0;
+            while (index + match < total && input[source + match] == input[index + match])
+            {
+                ++match;
+            }
+            if (match >= lzp_min_match)
+            {
+                output.push_back(marker);
+                lzp_put_length(output, match - lzp_min_match + 1U);
+                for (std::size_t step = index; step < index + match; ++step)
+                {
+                    context = (context << 8U) | input[step];
+                    if (step + 1U >= lzp_context_size && step + 1U < index + match)
+                    {
+                        table[lzp_slot(context, hash_bits)] = static_cast<std::uint32_t>(step) + 2U;
+                    }
+                }
+                index += match;
+                if (output.size() >= total)
+                {
+                    return std::nullopt;
+                }
+                continue;
+            }
+        }
+        const Byte value = input[index];
+        output.push_back(value);
+        if (value == marker)
+        {
+            lzp_put_length(output, 0U);
+        }
+        context = (context << 8U) | value;
+        ++index;
+        if (output.size() >= total)
+        {
+            return std::nullopt;
+        }
+    }
+    return output;
+}
+
+Bytes lzp_decode(const std::span<const Byte> input, const std::size_t expected_size,
+                 const unsigned int hash_bits)
+{
+    if (input.empty())
+    {
+        throw FormatError("LZP stream is empty");
+    }
+    const Byte marker = input[0];
+    Bytes output;
+    output.reserve(expected_size);
+    std::vector<std::uint32_t> table(std::size_t{1} << hash_bits, 0U);
+    std::uint64_t context = 0;
+    std::size_t position = 1;
+    const auto take = [&]() -> Byte
+    {
+        if (position >= input.size())
+        {
+            throw FormatError("truncated LZP stream");
+        }
+        return input[position++];
+    };
+
+    while (output.size() < expected_size)
+    {
+        std::uint32_t predicted = 0;
+        const std::size_t index = output.size();
+        if (index >= lzp_context_size)
+        {
+            const std::uint32_t slot = lzp_slot(context, hash_bits);
+            predicted = table[slot];
+            table[slot] = static_cast<std::uint32_t>(index) + 1U;
+        }
+        const Byte value = take();
+        if (value != marker)
+        {
+            output.push_back(value);
+            context = (context << 8U) | value;
+            continue;
+        }
+        std::uint64_t coded = 0;
+        unsigned int shift = 0;
+        while (true)
+        {
+            const Byte digit = take();
+            coded |= static_cast<std::uint64_t>(digit & 127U) << shift;
+            shift += 7U;
+            if ((digit & 128U) == 0U)
+            {
+                break;
+            }
+            if (shift > 35U)
+            {
+                throw FormatError("malformed LZP length");
+            }
+        }
+        if (coded == 0U)
+        {
+            output.push_back(marker);
+            context = (context << 8U) | marker;
+            continue;
+        }
+        const std::size_t match = static_cast<std::size_t>(coded) - 1U + lzp_min_match;
+        if (predicted == 0U || match > expected_size - index)
+        {
+            throw FormatError("LZP match escapes the block");
+        }
+        const std::size_t source = predicted - 1U;
+        for (std::size_t step = 0; step < match; ++step)
+        {
+            const Byte copied = output[source + step];
+            output.push_back(copied);
+            context = (context << 8U) | copied;
+            const std::size_t written = output.size() - 1U;
+            if (written + 1U >= lzp_context_size && written + 1U < index + match)
+            {
+                table[lzp_slot(context, hash_bits)] = static_cast<std::uint32_t>(written) + 2U;
+            }
+        }
+    }
+    if (position != input.size())
+    {
+        throw FormatError("LZP stream contains trailing bytes");
     }
     return output;
 }
