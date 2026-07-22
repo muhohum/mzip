@@ -15,10 +15,10 @@ On the Canterbury corpora (13 MB, 9 files) mzip compresses 7.3% smaller than bzi
 
 | Codec    |  Ratio |  Compress | Decompress |
 |----------|-------:|----------:|-----------:|
-| mzip     | 0.2048 | 12.5 MB/s |  17.8 MB/s |
-| gzip -9  | 0.2749 |  4.1 MB/s | 521.0 MB/s |
-| bzip2 -9 | 0.2211 | 24.6 MB/s |  63.9 MB/s |
-| xz -9    | 0.2127 |  3.1 MB/s | 150.1 MB/s |
+| mzip     | 0.2048 | 13.3 MB/s |  25.9 MB/s |
+| gzip -9  | 0.2749 |  4.0 MB/s | 484.6 MB/s |
+| bzip2 -9 | 0.2211 | 24.5 MB/s |  63.2 MB/s |
+| xz -9    | 0.2127 |  4.2 MB/s | 151.4 MB/s |
 
 ## Build
 

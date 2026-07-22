@@ -9,11 +9,11 @@ Python's standard-library bindings on the same data.
 ```sh
 python benchmarks/run_benchmark.py \
   --binary build/Release/mzip \
-  --repeat 3 \
+  --repeat 5 \
   --output benchmark-results.md
 ```
 
-All numbers are medians of three runs. mzip times include process start and file I/O; the
+All numbers are medians of five runs. mzip times include process start and file I/O; the
 reference codecs run in memory through C extension modules, which flatters their throughput
 slightly on the small files. `--threads` is forwarded to mzip (default: all cores).
 
@@ -24,10 +24,10 @@ build, Python 3.12. Total input: 13,065,681 bytes across 9 files.
 
 | Codec    | Total size |  Ratio |  Compress | Decompress |
 |----------|-----------:|-------:|----------:|-----------:|
-| mzip     |  2,676,409 | 0.2048 | 12.5 MB/s |  17.8 MB/s |
-| gzip -9  |  3,591,511 | 0.2749 |  4.1 MB/s | 521.0 MB/s |
-| bzip2 -9 |  2,888,233 | 0.2211 | 24.6 MB/s |  63.9 MB/s |
-| xz -9    |  2,778,764 | 0.2127 |  3.1 MB/s | 150.1 MB/s |
+| mzip     |  2,676,409 | 0.2048 | 13.3 MB/s |  25.9 MB/s |
+| gzip -9  |  3,591,511 | 0.2749 |  4.0 MB/s | 484.6 MB/s |
+| bzip2 -9 |  2,888,233 | 0.2211 | 24.5 MB/s |  63.2 MB/s |
+| xz -9    |  2,778,764 | 0.2127 |  4.2 MB/s | 151.4 MB/s |
 
 ## Archive sizes
 
@@ -48,15 +48,15 @@ build, Python 3.12. Total input: 13,065,681 bytes across 9 files.
 
 | File         |     Input | Compress | Decompress |
 |--------------|----------:|---------:|-----------:|
-| alice29.txt  |   152,089 |  20.6 ms |    13.7 ms |
-| fields.c     |    11,150 |  10.0 ms |    11.0 ms |
-| kennedy.xls  | 1,029,744 |  52.9 ms |    30.1 ms |
-| ptt5         |   513,216 |  31.4 ms |    18.1 ms |
-| aaa.txt      |   100,000 |  10.0 ms |     9.9 ms |
-| random.txt   |   100,000 |  21.8 ms |    15.5 ms |
-| world192.txt | 2,473,400 | 174.8 ms |    82.3 ms |
-| bible.txt    | 4,047,392 | 299.2 ms |   210.4 ms |
-| E.coli       | 4,638,690 | 423.4 ms |   341.3 ms |
+| alice29.txt  |   152,089 |  20.4 ms |    13.4 ms |
+| fields.c     |    11,150 |   9.6 ms |     9.0 ms |
+| kennedy.xls  | 1,029,744 |  51.7 ms |    31.7 ms |
+| ptt5         |   513,216 |  23.4 ms |    16.7 ms |
+| aaa.txt      |   100,000 |   8.7 ms |     8.0 ms |
+| random.txt   |   100,000 |  20.5 ms |    13.7 ms |
+| world192.txt | 2,473,400 | 154.5 ms |    75.4 ms |
+| bible.txt    | 4,047,392 | 283.9 ms |   128.8 ms |
+| E.coli       | 4,638,690 | 413.4 ms |   207.0 ms |
 
 ## Reading the numbers
 
