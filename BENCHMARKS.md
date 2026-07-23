@@ -16,14 +16,15 @@ python benchmarks/run_benchmark.py \
 ## Canterbury results
 
 Measured 2026-07-23 on an AMD Ryzen 9 7950X (16 cores), Windows 11, MSVC 19.44 Release
-build. Total input: 13,065,681 bytes across 9 files; mzip runs with default settings.
+build, medians of five runs on an idle machine. Total input: 13,065,681 bytes across 9
+files; mzip runs with default settings.
 
-| Codec    | Total size |  Ratio |
-|----------|-----------:|-------:|
-| mzip     |  2,484,577 | 0.1902 |
-| xz -9    |  2,778,764 | 0.2127 |
-| bzip2 -9 |  2,888,233 | 0.2211 |
-| gzip -9  |  3,591,511 | 0.2749 |
+| Codec    | Total size |  Ratio |  Compress | Decompress |
+|----------|-----------:|-------:|----------:|-----------:|
+| mzip     |  2,484,577 | 0.1902 |  4.4 MB/s |  11.7 MB/s |
+| xz -9    |  2,778,764 | 0.2127 |  3.4 MB/s | 154.7 MB/s |
+| bzip2 -9 |  2,888,233 | 0.2211 | 24.8 MB/s |  64.7 MB/s |
+| gzip -9  |  3,591,511 | 0.2749 |  4.2 MB/s | 522.5 MB/s |
 
 | File         | Kind             |      Input |      mzip |   gzip -9 |  bzip2 -9 |     xz -9 |
 |--------------|------------------|-----------:|----------:|----------:|----------:|----------:|
@@ -37,6 +38,18 @@ build. Total input: 13,065,681 bytes across 9 files; mzip runs with default sett
 | bible.txt    | King James Bible |  4,047,392 |   727,898 | 1,177,362 |   845,635 |   885,184 |
 | E.coli       | DNA sequence     |  4,638,690 | 1,118,018 | 1,299,729 | 1,251,004 | 1,186,488 |
 | total        |                  | 13,065,681 | 2,484,577 | 3,591,511 | 2,888,233 | 2,778,764 |
+
+| File         |     Input |  Compress | Decompress |
+|--------------|----------:|----------:|-----------:|
+| alice29.txt  |   152,089 |   33.6 ms |    16.6 ms |
+| fields.c     |    11,150 |    8.2 ms |     5.3 ms |
+| kennedy.xls  | 1,029,744 |   85.9 ms |    23.6 ms |
+| ptt5         |   513,216 |   54.1 ms |    38.0 ms |
+| aaa.txt      |   100,000 |   10.1 ms |     5.6 ms |
+| random.txt   |   100,000 |   23.7 ms |    14.4 ms |
+| world192.txt | 2,473,400 |  424.3 ms |   189.8 ms |
+| bible.txt    | 4,047,392 |  767.4 ms |   354.8 ms |
+| E.coli       | 4,638,690 | 1530.4 ms |   472.8 ms |
 
 ## Silesia results
 
@@ -103,6 +116,26 @@ block bzip3 supports:
 | mzip (defaults)      | 23,891,573 | 0.2389 | 198,171,513 | 0.1982 |
 | xz -9e               | 24,831,648 | 0.2483 | 211,776,220 | 0.2118 |
 | zstd -22 --long      | 25,333,695 | 0.2533 | 213,968,104 | 0.2140 |
+
+## Timings
+
+Single runs on an idle machine (same hardware, Linux/GCC 13 builds of every tool). mzip
+uses all cores; reference tools run as configured above. The native Windows build is timed
+in the Canterbury section.
+
+| Set                 | Codec           |          Compress |        Decompress |
+|---------------------|-----------------|------------------:|------------------:|
+| Silesia (212 MB)    | mzip (defaults) |  18 s (11.8 MB/s) |   7 s (30.3 MB/s) |
+|                     | bzip3 -b 64     |  16 s (13.2 MB/s) |  19 s (11.2 MB/s) |
+|                     | bsc -b64        |   7 s (30.3 MB/s) |   6 s (35.3 MB/s) |
+|                     | zstd -22 --long |  79 s (2.7 MB/s)  |    <1 s           |
+|                     | xz -9e          |  78 s (2.7 MB/s)  |     1 s           |
+| enwik9 (1 GB)       | mzip (defaults) |  57 s (17.5 MB/s) |  20 s (50.0 MB/s) |
+|                     | mzip --profile ratio | 469 s (2.1 MB/s) | 269 s (3.7 MB/s) |
+|                     | bzip3 -b 511    |  82 s (12.2 MB/s) | 117 s (8.5 MB/s)  |
+|                     | bsc -b511       |  50 s (20.0 MB/s) |  27 s (37.0 MB/s) |
+| versioned (127 MB)  | mzip (defaults) |   3 s (42.3 MB/s) |   2 s (63.4 MB/s) |
+|                     | mzip --profile ratio | 21 s (6.0 MB/s) |  3 s (42.3 MB/s) |
 
 ## Reading the numbers
 
