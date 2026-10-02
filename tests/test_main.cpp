@@ -12,6 +12,7 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -252,6 +253,82 @@ void test_bwt_randomized()
     }
 }
 
+// The transform as a definition: suffixes sorted with a proper prefix first, the sentinel's
+// own suffix in row 0, the row of suffix 0 left out as the primary index.
+[[nodiscard]] mzip::detail::BwtResult naive_bwt(const Bytes& input)
+{
+    std::vector<std::uint32_t> suffixes(input.size());
+    for (std::uint32_t index = 0; index < suffixes.size(); ++index)
+    {
+        suffixes[index] = index;
+    }
+    std::sort(suffixes.begin(), suffixes.end(),
+              [&](const std::uint32_t left, const std::uint32_t right)
+              {
+                  return std::lexicographical_compare(input.begin() + left, input.end(),
+                                                      input.begin() + right, input.end());
+              });
+    mzip::detail::BwtResult result;
+    if (input.empty())
+    {
+        return result;
+    }
+    result.data.push_back(input.back());
+    for (std::size_t rank = 0; rank < suffixes.size(); ++rank)
+    {
+        if (suffixes[rank] == 0U)
+        {
+            result.primary_index = static_cast<std::uint32_t>(rank + 1U);
+            continue;
+        }
+        result.data.push_back(input[suffixes[rank] - 1U]);
+    }
+    return result;
+}
+
+void test_bwt_matches_naive_sort()
+{
+    // Repetitive inputs make the suffix sorter recurse several levels deep.
+    std::vector<Bytes> cases;
+    Bytes fibonacci_previous = to_bytes("b");
+    Bytes fibonacci = to_bytes("a");
+    while (fibonacci.size() < 3'000U)
+    {
+        Bytes next = fibonacci;
+        next.insert(next.end(), fibonacci_previous.begin(), fibonacci_previous.end());
+        fibonacci_previous = std::move(fibonacci);
+        fibonacci = std::move(next);
+    }
+    cases.push_back(fibonacci);
+    cases.push_back(repeated_text(5'000U));
+    cases.push_back(random_bytes(6'000U, 41U));
+    std::mt19937 generator(20261002U);
+    for (const unsigned int alphabet : {2U, 3U, 7U, 256U})
+    {
+        for (const std::size_t period : {std::size_t{0}, std::size_t{13}, std::size_t{700}})
+        {
+            std::uniform_int_distribution<unsigned int> value_distribution(0U, alphabet - 1U);
+            Bytes input(4'000U);
+            for (std::size_t index = 0; index < input.size(); ++index)
+            {
+                input[index] = period != 0U && index >= period && index % 97U != 0U
+                                   ? input[index - period]
+                                   : static_cast<Byte>(255U - value_distribution(generator));
+            }
+            cases.push_back(input);
+        }
+    }
+
+    for (const Bytes& input : cases)
+    {
+        const mzip::detail::BwtResult expected = naive_bwt(input);
+        const mzip::detail::BwtResult encoded = mzip::detail::bwt_encode(input);
+        CHECK_EQ(encoded.data, expected.data);
+        CHECK_EQ(encoded.primary_index, expected.primary_index);
+        CHECK_EQ(mzip::detail::bwt_decode(encoded.data, encoded.primary_index), input);
+    }
+}
+
 void test_mtf_round_trip()
 {
     const std::vector<Bytes> cases{
@@ -342,6 +419,24 @@ void test_cm_and_lzp_round_trip()
     CHECK_EQ(mzip::detail::lzp_decode(*stream, repetitive.size()), repetitive);
 
     CHECK(!mzip::detail::lzp_encode(random_bytes(4'096U, 22U)).has_value());
+
+    // Two 48-byte repeats (with their 8-byte contexts), one 1,000 bytes back and one 6,000:
+    // too short for the plain rule, while a far rule takes the distant one, or both once its
+    // threshold drops below the near distance.
+    Bytes spaced = random_bytes(8'192U, 23U);
+    std::copy_n(spaced.begin() + 100, 56, spaced.begin() + 1'100);
+    std::copy_n(spaced.begin() + 300, 56, spaced.begin() + 6'300);
+    CHECK(!mzip::detail::lzp_encode(spaced).has_value());
+    const mzip::detail::LzpRule far_only{128U, 32U, 4'096U};
+    const mzip::detail::LzpRule near_too{128U, 32U, 512U};
+    const auto far_stream = mzip::detail::lzp_encode(spaced, 20U, far_only);
+    const auto near_stream = mzip::detail::lzp_encode(spaced, 20U, near_too);
+    CHECK(far_stream.has_value());
+    CHECK(near_stream.has_value());
+    CHECK(far_stream->size() < spaced.size());
+    CHECK(near_stream->size() < far_stream->size());
+    CHECK_EQ(mzip::detail::lzp_decode(*far_stream, spaced.size(), 20U, far_only), spaced);
+    CHECK_EQ(mzip::detail::lzp_decode(*near_stream, spaced.size(), 20U, near_too), spaced);
 }
 
 // A pseudo program: random filler with E8/E9 branches to a few targets inside the block and
@@ -526,6 +621,473 @@ void test_x86_flag_in_archives()
                         { static_cast<void>(mzip::decompress_file(random_archive, restored)); });
 }
 
+// A table of fixed-length records, like a catalogue or a database dump: an increasing 32-bit
+// counter, a drifting 16-bit level, and filler from a small alphabet.
+[[nodiscard]] Bytes synthetic_records(const std::size_t count, const std::size_t stride,
+                                      const std::uint32_t seed)
+{
+    std::mt19937 generator(seed);
+    std::uniform_int_distribution<unsigned int> step_distribution(0U, 40U);
+    std::uniform_int_distribution<unsigned int> drift_distribution(0U, 8U);
+    std::uniform_int_distribution<unsigned int> filler_distribution(0U, 3U);
+    Bytes table(count * stride);
+    std::uint32_t counter = 1'000U;
+    std::uint32_t level = 30'000U;
+    for (std::size_t record = 0; record < count; ++record)
+    {
+        Byte* const row = table.data() + record * stride;
+        counter += step_distribution(generator);
+        level = level + drift_distribution(generator) - 4U;
+        for (unsigned int byte = 0; byte < 4U; ++byte)
+        {
+            row[byte] = static_cast<Byte>((counter >> (byte * 8U)) & 0xFFU);
+        }
+        row[4] = static_cast<Byte>(level & 0xFFU);
+        row[5] = static_cast<Byte>((level >> 8U) & 0xFFU);
+        for (std::size_t byte = 6; byte < stride; ++byte)
+        {
+            row[byte] = static_cast<Byte>('A' + filler_distribution(generator));
+        }
+    }
+    return table;
+}
+
+// 16-bit little-endian samples of an image whose columns wander independently from row to
+// row, so a sample is far more like the one above it than like its neighbours in the row.
+[[nodiscard]] Bytes synthetic_image(const std::size_t width, const std::size_t height,
+                                    const std::uint32_t seed)
+{
+    std::mt19937 generator(seed);
+    std::uniform_int_distribution<unsigned int> start_distribution(1'000U, 3'000U);
+    std::uniform_int_distribution<unsigned int> step_distribution(0U, 80U);
+    std::vector<unsigned int> levels(width);
+    for (unsigned int& level : levels)
+    {
+        level = start_distribution(generator);
+    }
+    Bytes image(width * height * 2U);
+    for (std::size_t row = 0; row < height; ++row)
+    {
+        for (std::size_t column = 0; column < width; ++column)
+        {
+            unsigned int& level = levels[column];
+            level = level + step_distribution(generator) - 40U;
+            const std::size_t at = (row * width + column) * 2U;
+            image[at] = static_cast<Byte>(level & 0xFFU);
+            image[at + 1U] = static_cast<Byte>((level >> 8U) & 0xFFU);
+        }
+    }
+    return image;
+}
+
+[[nodiscard]] Bytes record_filter_round_trip(const Bytes& input,
+                                             const mzip::detail::RecordPlan& plan)
+{
+    Bytes coded = input;
+    mzip::detail::record_filter_encode(coded, plan);
+    Bytes restored = coded;
+    mzip::detail::record_filter_decode(restored, plan);
+    CHECK_EQ(restored, input);
+    return coded;
+}
+
+void test_record_filter_round_trip()
+{
+    using mzip::detail::RecordPlan;
+
+    // Stride 6 in 2-byte units, middle unit only: the first record stays, every later unit
+    // becomes its 16-bit difference to the record before (0x0102 - 0x01FF = 0xFF03), and the
+    // partial unit at the end is left alone.
+    const Bytes small{0x10U, 0x11U, 0xFFU, 0x01U, 0x12U, 0x13U, 0x20U, 0x21U, 0x02U,
+                      0x01U, 0x22U, 0x23U, 0x30U, 0x31U, 0x05U, 0x01U, 0x77U};
+    const Bytes expected{0x10U, 0x11U, 0xFFU, 0x01U, 0x12U, 0x13U, 0x20U, 0x21U, 0x03U,
+                         0xFFU, 0x22U, 0x23U, 0x30U, 0x31U, 0x03U, 0x00U, 0x77U};
+    CHECK_EQ(record_filter_round_trip(small, RecordPlan{6U, 2U, Bytes{0x02U}}), expected);
+    // Stride 6 in 4-byte units: the second unit is 2 bytes long (0x2322 - 0x1312 = 0x1010).
+    const Bytes expected_partial{0x10U, 0x11U, 0xFFU, 0x01U, 0x12U, 0x13U, 0x20U, 0x21U, 0x02U,
+                                 0x01U, 0x10U, 0x10U, 0x30U, 0x31U, 0x05U, 0x01U, 0x77U};
+    CHECK_EQ(record_filter_round_trip(small, RecordPlan{6U, 4U, Bytes{0x02U}}), expected_partial);
+
+    // Every unit width, several strides and masks, tails of every length.
+    std::mt19937 generator(20261002U);
+    std::uniform_int_distribution<unsigned int> byte_distribution(0U, 255U);
+    for (const std::uint32_t unit : {1U, 2U, 4U, 8U})
+    {
+        // Whole units, and a shorter last unit when the unit does not divide the stride.
+        for (const std::uint32_t stride : {unit, 3U * unit, 8U * unit, 9U * unit + 1U, 28U, 100U})
+        {
+            const std::uint32_t units = (stride + unit - 1U) / unit;
+            RecordPlan plan{stride, unit, Bytes((units + 7U) / 8U)};
+            plan.mask[0] = 0x01U;
+            for (std::uint32_t column = 1; column < units; ++column)
+            {
+                if (byte_distribution(generator) % 3U != 0U)
+                {
+                    plan.mask[column / 8U] =
+                        static_cast<Byte>(plan.mask[column / 8U] | (1U << (column % 8U)));
+                }
+            }
+            for (const std::size_t tail :
+                 {std::size_t{0}, std::size_t{1}, std::size_t{unit}, std::size_t{stride - 1U}})
+            {
+                Bytes input = synthetic_records(50U, stride + 6U, stride + unit);
+                input.resize(std::size_t{stride} * 37U + tail);
+                for (std::size_t index = 0; index < input.size(); index += 5U)
+                {
+                    input[index] = static_cast<Byte>(byte_distribution(generator));
+                }
+                static_cast<void>(record_filter_round_trip(input, plan));
+                const Bytes serialized = mzip::detail::record_plan_write(plan);
+                std::size_t consumed = 0;
+                const RecordPlan parsed =
+                    mzip::detail::record_plan_read(serialized, input.size(), consumed);
+                CHECK_EQ(consumed, serialized.size());
+                CHECK_EQ(parsed.stride, plan.stride);
+                CHECK_EQ(parsed.unit, plan.unit);
+                CHECK_EQ(parsed.mask, plan.mask);
+            }
+        }
+    }
+    // Data shorter than one record passes through.
+    const Bytes short_input = random_bytes(5U, 3U);
+    CHECK_EQ(record_filter_round_trip(short_input, RecordPlan{8U, 1U, Bytes{0xFFU}}), short_input);
+
+    // The search finds the record length of tables and of image rows, and nothing in random
+    // bytes or text.
+    for (const std::size_t stride : {std::size_t{12}, std::size_t{28}, std::size_t{100}})
+    {
+        const Bytes table = synthetic_records(160'000U / stride, stride, 7U);
+        const std::optional<RecordPlan> plan = mzip::detail::record_plan(table);
+        CHECK(plan.has_value());
+        if (plan)
+        {
+            CHECK_EQ(plan->stride, stride);
+            CHECK_EQ(unsigned{plan->mask[0]} & 0x01U, 0x01U);
+            static_cast<void>(record_filter_round_trip(table, *plan));
+        }
+    }
+    const Bytes image = synthetic_image(300U, 300U, 11U);
+    const std::optional<RecordPlan> image_plan = mzip::detail::record_plan(image);
+    CHECK(image_plan.has_value());
+    if (image_plan)
+    {
+        CHECK_EQ(image_plan->stride, 600U);
+        CHECK_EQ(image_plan->unit, 2U);
+        static_cast<void>(record_filter_round_trip(image, *image_plan));
+    }
+    CHECK(!mzip::detail::record_plan(random_bytes(200'000U, 41U)).has_value());
+    CHECK(!mzip::detail::record_plan(repeated_text(200'000U)).has_value());
+    CHECK(!mzip::detail::record_plan(Bytes(100U, Byte{7U})).has_value());
+
+    // Slices of a real file, under a table plan and a 16-bit plan.
+    for (const char* candidate : {"/usr/bin/ls", "/bin/ls", "/usr/bin/env", "/bin/sh"})
+    {
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(candidate, error))
+        {
+            continue;
+        }
+        Bytes binary = read_file(candidate);
+        binary.resize(std::min<std::size_t>(binary.size(), 256U * 1024U));
+        static_cast<void>(record_filter_round_trip(binary, RecordPlan{28U, 4U, Bytes{0x5BU}}));
+        static_cast<void>(
+            record_filter_round_trip(binary, RecordPlan{1024U, 2U, Bytes(64U, Byte{0xFFU})}));
+        break;
+    }
+
+    // Plans the encoder cannot write are rejected.
+    const auto expect_bad_plan = [](const Bytes& serialized, const std::size_t block_size)
+    {
+        std::size_t consumed = 0;
+        expect_format_error(
+            [&] {
+                static_cast<void>(mzip::detail::record_plan_read(serialized, block_size, consumed));
+            });
+    };
+    expect_bad_plan(Bytes{}, 1'000U);
+    expect_bad_plan(Bytes{1U, 28U}, 1'000U);                   // truncated header
+    expect_bad_plan(Bytes{3U, 6U, 0U, 0x01U}, 1'000U);         // unit 3
+    expect_bad_plan(Bytes{0U, 6U, 0U, 0x01U}, 1'000U);         // unit 0
+    expect_bad_plan(Bytes{1U, 0U, 0U}, 1'000U);                // stride 0
+    expect_bad_plan(Bytes{8U, 6U, 0U, 0x01U}, 1'000U);         // unit longer than the stride
+    expect_bad_plan(Bytes{1U, 0xE8U, 0x03U, 0x01U}, 1'000U);   // stride as long as the block
+    expect_bad_plan(Bytes{1U, 28U, 0U, 0x01U, 0x00U}, 1'000U); // truncated mask
+    expect_bad_plan(Bytes{1U, 4U, 0U, 0x00U}, 1'000U);         // nothing selected
+    expect_bad_plan(Bytes{1U, 4U, 0U, 0x10U}, 1'000U);         // a unit past the record
+    expect_bad_plan(Bytes{2U, 6U, 0U, 0x08U}, 1'000U);         // a unit past the record
+}
+
+void test_record_flag_in_archives()
+{
+    TemporaryDirectory directory;
+    const auto source = directory.file("table.bin");
+    const auto archive = directory.file("table.mz");
+    const auto restored = directory.file("table.out");
+    const Bytes table = synthetic_records(8'000U, 28U, 5U);
+    write_file(source, table);
+    const auto stats = mzip::compress_file(source, archive);
+    CHECK_EQ(stats.block_count, 1U);
+    const Bytes bytes = read_file(archive);
+    // Flag bit 2 of the block header; the plan opens the payload after the 48 header bytes.
+    CHECK(bytes.size() > 52U);
+    CHECK_EQ(bytes[24], Byte{2U});
+    CHECK_EQ(bytes[25], Byte{0x04U});
+    CHECK_EQ(bytes[49], Byte{28U});
+    static_cast<void>(mzip::decompress_file(archive, restored));
+    CHECK_EQ(read_file(restored), table);
+
+    // Rows of 16-bit samples take the filter with 2-byte units.
+    const auto image_source = directory.file("image.bin");
+    const Bytes image = synthetic_image(256U, 400U, 13U);
+    write_file(image_source, image);
+    static_cast<void>(mzip::compress_file(image_source, archive));
+    const Bytes image_bytes = read_file(archive);
+    CHECK(image_bytes.size() > 52U);
+    CHECK_EQ(image_bytes[25], Byte{0x04U});
+    CHECK_EQ(image_bytes[48], Byte{2U});
+    static_cast<void>(mzip::decompress_file(archive, restored));
+    CHECK_EQ(read_file(restored), image);
+
+    const auto expect_rejected = [&](const Bytes& damaged)
+    {
+        write_file(archive, damaged);
+        expect_format_error([&] { static_cast<void>(mzip::decompress_file(archive, restored)); });
+    };
+    // Version 2 archives may not carry the flag.
+    Bytes downgraded = bytes;
+    downgraded[4] = 2U;
+    expect_rejected(downgraded);
+    // It combines with neither LZP nor the x86 filter, and needs the mixer.
+    for (const Byte flags : {Byte{0x05U}, Byte{0x06U}, Byte{0x07U}})
+    {
+        Bytes combined = bytes;
+        combined[25] = flags;
+        expect_rejected(combined);
+    }
+    Bytes transformed = bytes;
+    transformed[24] = 1U;
+    expect_rejected(transformed);
+    // A damaged plan: bad unit, zero stride, stride beyond the block, empty mask.
+    const auto damaged_plan = [&](const std::size_t offset, const Byte value)
+    {
+        Bytes damaged = bytes;
+        damaged[offset] = value;
+        return damaged;
+    };
+    expect_rejected(damaged_plan(48U, Byte{5U}));
+    Bytes zero_stride = damaged_plan(49U, Byte{0U});
+    zero_stride[50] = 0U;
+    expect_rejected(zero_stride);
+    expect_rejected(damaged_plan(50U, Byte{0xFFU}));
+    expect_rejected(damaged_plan(51U, Byte{0U}));
+    // A payload too short to hold the plan.
+    Bytes truncated(bytes.begin(), bytes.begin() + 50);
+    write_u32(truncated, 32U, 2U);
+    expect_rejected(truncated);
+
+    // Raw blocks may not carry the flag.
+    const auto random_source = directory.file("random.bin");
+    const auto random_archive = directory.file("random.mz");
+    write_file(random_source, random_bytes(8'192U, 33U));
+    const auto random_stats = mzip::compress_file(random_source, random_archive);
+    CHECK_EQ(random_stats.raw_blocks, 1U);
+    Bytes raw = read_file(random_archive);
+    CHECK_EQ(raw[25], Byte{0U});
+    raw[25] = 0x04U;
+    write_file(random_archive, raw);
+    expect_format_error([&]
+                        { static_cast<void>(mzip::decompress_file(random_archive, restored)); });
+}
+
+// Words from a small vocabulary, then the same words spelled backwards, then forwards again:
+// one alphabet whose statistics change twice, exactly at multiples of `part_size`.
+[[nodiscard]] Bytes mixed_content(const std::size_t part_size, const std::uint32_t seed)
+{
+    constexpr std::array<std::string_view, 8> forward{"alpha ", "beta ", "gamma ", "delta ",
+                                                      "block ", "sort ", "model ", "mixer\n"};
+    constexpr std::array<std::string_view, 8> backward{"ahpla ", "ateb ", "ammag ", "atled ",
+                                                       "kcolb ", "tros ", "ledom ", "rexim\n"};
+    std::mt19937 generator(seed);
+    std::uniform_int_distribution<std::size_t> word_distribution(0U, forward.size() - 1U);
+    Bytes data;
+    for (const auto* words : {&forward, &backward, &forward})
+    {
+        const std::size_t end = data.size() + part_size;
+        while (data.size() < end)
+        {
+            const Bytes word = to_bytes((*words)[word_distribution(generator)]);
+            data.insert(data.end(), word.begin(), word.end());
+        }
+        data.resize(end);
+    }
+    return data;
+}
+
+void test_content_boundaries()
+{
+    constexpr std::size_t part = 320U * 1024U;
+    const Bytes mixed = mixed_content(part, 3U);
+    const std::vector<std::size_t> cuts = mzip::detail::content_boundaries(mixed);
+    CHECK_EQ(cuts.size(), std::size_t{2});
+    if (cuts.size() == 2U)
+    {
+        CHECK(cuts[0] + 64U > part && cuts[0] < part + 64U);
+        CHECK(cuts[1] + 64U > 2U * part && cuts[1] < 2U * part + 64U);
+    }
+
+    // Uniform data stays whole, and so does a change too close to the end.
+    Bytes text;
+    for (std::uint32_t seed = 10U; seed < 13U; ++seed)
+    {
+        const Bytes more = mixed_content(part, seed);
+        text.insert(text.end(), more.begin(), more.begin() + static_cast<std::ptrdiff_t>(part));
+    }
+    CHECK(mzip::detail::content_boundaries(text).empty());
+    CHECK(mzip::detail::content_boundaries(random_bytes(3U * part, 5U)).empty());
+    const Bytes small(mixed.begin(), mixed.begin() + static_cast<std::ptrdiff_t>(part + 1000U));
+    CHECK(mzip::detail::content_boundaries(small).empty());
+    CHECK(mzip::detail::content_boundaries(Bytes{}).empty());
+
+    // A change whose content repeats on both sides of the cut, like a tar of similar files,
+    // codes better whole.
+    Bytes repeated = mixed;
+    repeated.insert(repeated.end(), mixed.begin(), mixed.end());
+    CHECK(mzip::detail::content_boundaries(repeated).empty());
+}
+
+void test_segmented_archives()
+{
+    constexpr std::size_t part = 320U * 1024U;
+    const Bytes data = mixed_content(part, 6U);
+    TemporaryDirectory directory;
+    const auto source = directory.file("mixed.bin");
+    const auto archive = directory.file("mixed.mz");
+    const auto restored = directory.file("mixed.out");
+    write_file(source, data);
+
+    mzip::CompressionOptions single;
+    single.thread_count = 1U;
+    const auto stats = mzip::compress_file(source, archive, single);
+    CHECK_EQ(stats.block_count, 3U);
+    const Bytes bytes = read_file(archive);
+    CHECK(bytes.size() > 48U);
+    // Flags byte: bit 2 marks blocks that end before the block size; the count follows.
+    CHECK_EQ(bytes[5], Byte{0x04U});
+    CHECK_EQ(bytes[20], Byte{3U});
+    static_cast<void>(mzip::decompress_file(archive, restored));
+    CHECK_EQ(read_file(restored), data);
+
+    mzip::CompressionOptions parallel;
+    parallel.thread_count = 8U;
+    const auto parallel_archive = directory.file("parallel.mz");
+    static_cast<void>(mzip::compress_file(source, parallel_archive, parallel));
+    CHECK_EQ(read_file(parallel_archive), bytes);
+    mzip::DecompressionOptions sequential;
+    sequential.thread_count = 1U;
+    const auto restored_sequential = directory.file("sequential.out");
+    static_cast<void>(mzip::decompress_file(archive, restored_sequential, sequential));
+    CHECK_EQ(read_file(restored_sequential), data);
+
+    // The ratio profile cuts its single chunk the same way.
+    mzip::CompressionOptions ratio;
+    ratio.profile = mzip::Profile::ratio;
+    const auto ratio_archive = directory.file("ratio.mz");
+    const auto ratio_stats = mzip::compress_file(source, ratio_archive, ratio);
+    CHECK_EQ(ratio_stats.block_count, 3U);
+    const auto ratio_restored = directory.file("ratio.out");
+    static_cast<void>(mzip::decompress_file(ratio_archive, ratio_restored));
+    CHECK_EQ(read_file(ratio_restored), data);
+
+    // Several chunks, each cut where it changes, under a stream LZP pass: a directory holding
+    // the data twice, in chunks that do not line up with the content.
+    const auto tree = directory.file("tree");
+    std::filesystem::create_directories(tree);
+    write_file(tree / "a.bin", data);
+    write_file(tree / "b.bin", data);
+    mzip::CompressionOptions chunked;
+    chunked.block_size = 700U * 1024U;
+    const auto tree_archive = directory.file("tree.mz");
+    const auto tree_stats = mzip::compress_file(tree, tree_archive, chunked);
+    const Bytes tree_bytes = read_file(tree_archive);
+    CHECK_EQ(tree_bytes[5], Byte{0x07U});
+    CHECK(tree_stats.block_count > 2U);
+    const auto tree_restored = directory.file("tree-out");
+    static_cast<void>(mzip::decompress_file(tree_archive, tree_restored));
+    CHECK_EQ(read_file(tree_restored / "tree" / "a.bin"), data);
+    CHECK_EQ(read_file(tree_restored / "tree" / "b.bin"), data);
+
+    // A cut chunk followed by one that stays whole.
+    const Bytes noise = random_bytes(3U * part, 7U);
+    Bytes two_chunks = data;
+    two_chunks.insert(two_chunks.end(), noise.begin(), noise.end());
+    const auto two_chunks_source = directory.file("two-chunks.bin");
+    write_file(two_chunks_source, two_chunks);
+    mzip::CompressionOptions halves;
+    halves.block_size = static_cast<std::uint32_t>(3U * part);
+    const auto two_chunks_archive = directory.file("two-chunks.mz");
+    const auto two_chunks_stats =
+        mzip::compress_file(two_chunks_source, two_chunks_archive, halves);
+    CHECK_EQ(two_chunks_stats.block_count, 4U);
+    const auto two_chunks_restored = directory.file("two-chunks.out");
+    static_cast<void>(mzip::decompress_file(two_chunks_archive, two_chunks_restored));
+    CHECK_EQ(read_file(two_chunks_restored), two_chunks);
+
+    const auto expect_rejected = [&](const Bytes& damaged)
+    {
+        const auto hostile = directory.file("hostile.mz");
+        const auto output = directory.file("hostile.out");
+        write_file(hostile, damaged);
+        expect_format_error([&] { static_cast<void>(mzip::decompress_file(hostile, output)); });
+        CHECK(!std::filesystem::exists(output));
+    };
+    // Short blocks need the flag, the flag needs version 3, and the count must fit the sizes.
+    Bytes unflagged = bytes;
+    unflagged[5] = 0U;
+    expect_rejected(unflagged);
+    Bytes downgraded = bytes;
+    downgraded[4] = 2U;
+    expect_rejected(downgraded);
+    for (const std::uint32_t count : {0U, 1U, 2U, 4U, static_cast<std::uint32_t>(data.size() + 1U)})
+    {
+        Bytes recounted = bytes;
+        write_u32(recounted, 20U, count);
+        expect_rejected(recounted);
+    }
+    // A first block larger than the block size, or empty.
+    for (const std::uint32_t size : {0U, static_cast<std::uint32_t>(data.size() + 1U)})
+    {
+        Bytes resized = bytes;
+        write_u32(resized, 28U, size);
+        expect_rejected(resized);
+    }
+    // Blocks that no longer add up to the original size.
+    const std::size_t second_header = 48U + (std::size_t{bytes[32]} | std::size_t{bytes[33]} << 8U |
+                                             std::size_t{bytes[34]} << 16U);
+    CHECK(bytes.size() > second_header + 24U);
+    for (const std::uint32_t delta : {1U, 0xFFFF'FFFFU})
+    {
+        Bytes resized = bytes;
+        const std::uint32_t size = static_cast<std::uint32_t>(resized[second_header + 4U] |
+                                                              resized[second_header + 5U] << 8U |
+                                                              resized[second_header + 6U] << 16U);
+        write_u32(resized, second_header + 4U, size + delta);
+        expect_rejected(resized);
+    }
+
+    // Full-size blocks are still valid under the flag.
+    const auto plain_source = directory.file("plain.txt");
+    write_file(plain_source, repeated_text(50'000U));
+    const auto plain_archive = directory.file("plain.mz");
+    static_cast<void>(mzip::compress_file(plain_source, plain_archive));
+    Bytes flagged = read_file(plain_archive);
+    CHECK_EQ(flagged[5], Byte{0U});
+    flagged[5] = 0x04U;
+    write_file(plain_archive, flagged);
+    const auto plain_restored = directory.file("plain.out");
+    static_cast<void>(mzip::decompress_file(plain_archive, plain_restored));
+    CHECK_EQ(read_file(plain_restored), repeated_text(50'000U));
+}
+
 void test_stream_lzp_round_trip()
 {
     const Bytes chunk = random_bytes(3'000U, 33U);
@@ -564,6 +1126,30 @@ void test_stream_lzp_round_trip()
     const auto whole_restored = directory.file("whole.out");
     static_cast<void>(mzip::decompress_file(whole_archive, whole_restored));
     CHECK_EQ(read_file(whole_restored), data);
+
+    // Repeats too short for the block passes count for the stream pass once their source lies
+    // a block or more back; version 2 decoders never took them, so a downgraded archive fails.
+    Bytes distant = random_bytes(24'000U, 41U);
+    for (std::size_t target = 2'000U; target + 64U < distant.size(); target += 700U)
+    {
+        const std::size_t origin = target - 1'500U - target % 300U;
+        std::copy_n(distant.begin() + static_cast<std::ptrdiff_t>(origin), 8U + 48U,
+                    distant.begin() + static_cast<std::ptrdiff_t>(target));
+    }
+    const auto distant_source = directory.file("distant.bin");
+    const auto distant_archive = directory.file("distant.mz");
+    write_file(distant_source, distant);
+    const auto distant_stats = mzip::compress_file(distant_source, distant_archive, options);
+    CHECK(distant_stats.output_size < distant.size());
+    Bytes distant_bytes = read_file(distant_archive);
+    CHECK_EQ(distant_bytes[5] & 0x02U, 0x02U);
+    const auto distant_restored = directory.file("distant.out");
+    static_cast<void>(mzip::decompress_file(distant_archive, distant_restored));
+    CHECK_EQ(read_file(distant_restored), distant);
+    distant_bytes[4] = 2U;
+    write_file(distant_archive, distant_bytes);
+    expect_format_error(
+        [&] { static_cast<void>(mzip::decompress_file(distant_archive, distant_restored)); });
 
     const auto tree = directory.file("tree");
     std::filesystem::create_directories(tree);
@@ -844,31 +1430,30 @@ void test_golden_archive()
         0x4DU, 0x5AU, 0x49U, 0x50U, 0x03U, 0x02U, 0x00U, 0x00U, 0x00U, 0x04U, 0x00U, 0x00U, 0x28U,
         0x0AU, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x01U, 0x00U, 0x00U, 0x00U, 0x7EU, 0x01U,
         0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0xE4U, 0x90U, 0xB6U, 0x1EU, 0x14U, 0x00U, 0x00U,
-        0x00U, 0x02U, 0x00U, 0x00U, 0x00U, 0x7EU, 0x01U, 0x00U, 0x00U, 0x27U, 0x01U, 0x00U, 0x00U,
-        0x79U, 0x01U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x12U, 0xADU, 0xA1U, 0x37U, 0xFBU,
-        0xFBU, 0x53U, 0x95U, 0xFFU, 0xFDU, 0x67U, 0x11U, 0x0AU, 0xCCU, 0x0AU, 0xAAU, 0xF6U, 0x1BU,
-        0xAAU, 0x8DU, 0x42U, 0x25U, 0x33U, 0xA5U, 0xE1U, 0x22U, 0x40U, 0x40U, 0x32U, 0xC9U, 0xF7U,
-        0xBFU, 0xC1U, 0x6FU, 0x65U, 0x20U, 0x80U, 0x20U, 0x1BU, 0x1DU, 0x3DU, 0x99U, 0x16U, 0xB3U,
-        0x66U, 0x85U, 0x61U, 0x62U, 0xC0U, 0x6AU, 0x5BU, 0x73U, 0xC1U, 0xC4U, 0xC0U, 0x0FU, 0xE0U,
-        0x84U, 0x14U, 0xA4U, 0x49U, 0x60U, 0x6FU, 0xF3U, 0xEBU, 0x89U, 0x9EU, 0x28U, 0x57U, 0x11U,
-        0xB1U, 0xE4U, 0xB4U, 0xA3U, 0x57U, 0x5EU, 0x4DU, 0xA9U, 0xD7U, 0x60U, 0x4DU, 0x47U, 0x3DU,
-        0x1FU, 0x76U, 0x26U, 0x65U, 0xE9U, 0x31U, 0x2BU, 0xD4U, 0x99U, 0xDBU, 0x70U, 0x41U, 0xCFU,
-        0x32U, 0xC8U, 0x44U, 0xF2U, 0xDCU, 0x55U, 0xCBU, 0x78U, 0x87U, 0x9AU, 0x6DU, 0x70U, 0xCDU,
-        0x44U, 0x69U, 0x61U, 0x3CU, 0x74U, 0xA3U, 0x68U, 0x05U, 0xD4U, 0x5DU, 0x22U, 0xBCU, 0xB3U,
-        0x60U, 0xC4U, 0xBBU, 0x8BU, 0x3CU, 0x80U, 0x03U, 0xCFU, 0x19U, 0xF6U, 0xDDU, 0x60U, 0x66U,
-        0xA3U, 0xA9U, 0x73U, 0xBDU, 0x06U, 0x12U, 0xB4U, 0x26U, 0xC1U, 0x4AU, 0x2FU, 0xEAU, 0xA6U,
-        0x00U, 0x5FU, 0xB4U, 0x79U, 0xDFU, 0x7CU, 0xA0U, 0xE4U, 0x1BU, 0xD4U, 0xD2U, 0x70U, 0x40U,
-        0xA6U, 0x9FU, 0x42U, 0x90U, 0x45U, 0x57U, 0xA2U, 0x01U, 0x83U, 0x89U, 0x32U, 0x06U, 0x52U,
-        0x41U, 0xFEU, 0x88U, 0xECU, 0xB0U, 0x14U, 0x32U, 0xADU, 0xB1U, 0x3AU, 0x89U, 0xBEU, 0xB1U,
-        0x63U, 0x63U, 0xFEU, 0x07U, 0x3CU, 0x74U, 0x8FU, 0x87U, 0x61U, 0xADU, 0xABU, 0xB9U, 0x40U,
-        0x27U, 0x1DU, 0x83U, 0xE6U, 0x9FU, 0x26U, 0x6DU, 0xE7U, 0x18U, 0x26U, 0xBEU, 0xB4U, 0xCAU,
-        0xFEU, 0x62U, 0x72U, 0x98U, 0x28U, 0xBFU, 0xA1U, 0x9CU, 0x61U, 0x23U, 0xEEU, 0xCFU, 0xB1U,
-        0xC5U, 0xA2U, 0x4DU, 0x5BU, 0x1EU, 0x29U, 0x01U, 0x31U, 0xF1U, 0x2EU, 0x4DU, 0x70U, 0x1AU,
-        0x07U, 0x34U, 0xCCU, 0x71U, 0x97U, 0x26U, 0xCCU, 0x47U, 0xE9U, 0x86U, 0x4BU, 0xA5U, 0xB2U,
-        0xEBU, 0x59U, 0x97U, 0xB7U, 0x5CU, 0x3EU, 0x65U, 0x28U, 0x46U, 0x2EU, 0x8BU, 0x0AU, 0x1FU,
-        0x12U, 0x06U, 0x32U, 0x85U, 0x18U, 0x96U, 0xE7U, 0x1AU, 0x08U, 0x63U, 0x26U, 0x5DU, 0x5BU,
-        0xC4U, 0x8DU, 0x0BU, 0x29U, 0x5FU, 0x32U, 0x04U, 0x27U, 0x61U, 0xD1U, 0xDFU, 0x39U, 0x97U,
-        0x5CU, 0x27U, 0x1DU, 0x46U, 0x3AU, 0x8CU, 0x79U, 0x6AU};
+        0x00U, 0x02U, 0x00U, 0x00U, 0x00U, 0x7EU, 0x01U, 0x00U, 0x00U, 0x16U, 0x01U, 0x00U, 0x00U,
+        0x79U, 0x01U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x12U, 0xADU, 0xA1U, 0x37U, 0xFEU,
+        0x02U, 0xE1U, 0xD5U, 0x9FU, 0xE0U, 0x9EU, 0x8EU, 0xF5U, 0x76U, 0x78U, 0x67U, 0x4DU, 0x55U,
+        0x92U, 0x27U, 0x1FU, 0xE1U, 0x63U, 0x63U, 0x4CU, 0xF1U, 0x52U, 0x5AU, 0x8BU, 0xA2U, 0x87U,
+        0xECU, 0xCEU, 0x24U, 0x03U, 0x3AU, 0x54U, 0xA9U, 0xF6U, 0x38U, 0xECU, 0xBDU, 0xBEU, 0x6FU,
+        0x43U, 0xD8U, 0xEDU, 0xC2U, 0x29U, 0x7AU, 0xD4U, 0x1CU, 0x0DU, 0x70U, 0x87U, 0x52U, 0x15U,
+        0xEFU, 0xD4U, 0x6CU, 0xC1U, 0x0BU, 0x1AU, 0xC8U, 0xF0U, 0x15U, 0x63U, 0x6DU, 0xD0U, 0x94U,
+        0x1BU, 0xFEU, 0x92U, 0x05U, 0xFCU, 0x7DU, 0x1FU, 0x04U, 0xBCU, 0xD6U, 0x04U, 0xABU, 0x07U,
+        0x21U, 0x84U, 0x99U, 0x00U, 0xA2U, 0x4DU, 0x71U, 0xFCU, 0xAEU, 0xF6U, 0xCEU, 0xEEU, 0xC8U,
+        0xCCU, 0x07U, 0x4AU, 0x9BU, 0x18U, 0xCDU, 0x6AU, 0xB6U, 0xDFU, 0x8DU, 0x9DU, 0xD7U, 0x60U,
+        0x3CU, 0x0EU, 0x5BU, 0x91U, 0x98U, 0x3CU, 0xE3U, 0xCBU, 0xF6U, 0xDAU, 0xC4U, 0x84U, 0x76U,
+        0x6CU, 0xAFU, 0xD4U, 0xE4U, 0x9AU, 0xB2U, 0x9FU, 0x44U, 0x24U, 0xD1U, 0x2EU, 0x45U, 0xF6U,
+        0xE6U, 0x7EU, 0x16U, 0xACU, 0x99U, 0xB6U, 0xB5U, 0x59U, 0xEFU, 0x8DU, 0xFAU, 0x73U, 0xF8U,
+        0x20U, 0xDEU, 0x4DU, 0x11U, 0xC5U, 0xFFU, 0x38U, 0xCAU, 0x74U, 0x7FU, 0x88U, 0x1DU, 0x11U,
+        0x1CU, 0x03U, 0xA6U, 0x2AU, 0x6EU, 0xB0U, 0x6DU, 0xA8U, 0x94U, 0xC1U, 0x11U, 0xA5U, 0xE5U,
+        0x31U, 0x81U, 0x8FU, 0x81U, 0xA3U, 0xF0U, 0x4AU, 0x8AU, 0x2EU, 0xA8U, 0x4BU, 0x0AU, 0x4BU,
+        0xF8U, 0xFAU, 0x45U, 0x5DU, 0xE6U, 0xB1U, 0x40U, 0x54U, 0xD5U, 0x7FU, 0x41U, 0x01U, 0x2AU,
+        0x22U, 0xE2U, 0xE2U, 0x3BU, 0x05U, 0x7EU, 0xAFU, 0x14U, 0x6BU, 0x92U, 0xDAU, 0x3BU, 0x1CU,
+        0x0DU, 0xE8U, 0x8FU, 0x2EU, 0xACU, 0xEAU, 0xD5U, 0x64U, 0x3AU, 0x2FU, 0xBAU, 0x66U, 0x7DU,
+        0x9EU, 0x5AU, 0x0FU, 0x31U, 0x6CU, 0x40U, 0x68U, 0x2DU, 0xE5U, 0xBCU, 0x55U, 0x26U, 0xC1U,
+        0x7EU, 0x3AU, 0xD0U, 0x34U, 0x95U, 0x6DU, 0xC7U, 0x4EU, 0x1EU, 0xD0U, 0x68U, 0xDBU, 0x58U,
+        0x9CU, 0x22U, 0x14U, 0xBCU, 0xF4U, 0x59U, 0x86U, 0xADU, 0x1BU, 0x34U, 0xE1U, 0x00U, 0x29U,
+        0x4AU, 0xDBU, 0x48U, 0xB3U, 0x5FU, 0xECU, 0x86U, 0xE6U, 0x7CU, 0xDDU, 0x72U, 0x34U, 0xF3U,
+        0x4EU, 0xF0U, 0x01U, 0x93U};
 
     static const unsigned char golden_v2[] = {
         0x4DU, 0x5AU, 0x49U, 0x50U, 0x02U, 0x02U, 0x00U, 0x00U, 0x00U, 0x04U, 0x00U, 0x00U, 0x28U,
@@ -1249,6 +1834,59 @@ void test_thread_count_does_not_change_output()
     CHECK_EQ(read_file(restored_sequential), data);
 }
 
+// A single-block input whose candidates all compete: the archive must not depend on the thread
+// count, so threads may only ever be spent on other blocks.
+void test_thread_count_does_not_change_single_block()
+{
+    TemporaryDirectory directory;
+    // Machine code, then text, then repeats: the x86, LZP and plain candidates all compete.
+    Bytes mixed = synthetic_x86(120'000U, 51U);
+    const Bytes text = repeated_text(60'000U);
+    mixed.insert(mixed.end(), text.begin(), text.end());
+    const Bytes chunk = random_bytes(4'000U, 52U);
+    for (unsigned int copy = 0; copy < 12U; ++copy)
+    {
+        mixed.insert(mixed.end(), chunk.begin(), chunk.end());
+    }
+    // Stepped values, where the run coders compete with the mixer.
+    Bytes table;
+    for (std::uint32_t row = 0; row < 40'000U; ++row)
+    {
+        table.push_back(static_cast<Byte>(row / 300U));
+        table.push_back(static_cast<Byte>((row * 7U) / 1000U));
+    }
+
+    for (const Bytes& data : {mixed, table, repeated_text(100'000U), random_bytes(30'000U, 53U)})
+    {
+        const auto source = directory.file("single.bin");
+        write_file(source, data);
+        for (const mzip::Profile profile : {mzip::Profile::balanced, mzip::Profile::ratio})
+        {
+            Bytes reference;
+            for (const std::uint32_t threads : {1U, 2U, 8U})
+            {
+                mzip::CompressionOptions options;
+                options.profile = profile;
+                options.thread_count = threads;
+                const auto archive = directory.file("single-" + std::to_string(threads) + ".mz");
+                const auto stats = mzip::compress_file(source, archive, options);
+                CHECK_EQ(stats.block_count, 1U);
+                const Bytes bytes = read_file(archive);
+                if (threads == 1U)
+                {
+                    reference = bytes;
+                }
+                CHECK_EQ(bytes, reference);
+
+                const auto restored = directory.file("single.out");
+                static_cast<void>(mzip::decompress_file(archive, restored));
+                CHECK_EQ(read_file(restored), data);
+                std::filesystem::remove(restored);
+            }
+        }
+    }
+}
+
 void test_same_input_and_output_is_rejected()
 {
     TemporaryDirectory directory;
@@ -1294,12 +1932,17 @@ int main()
 {
     run_test("BWT round-trip", test_bwt_round_trip);
     run_test("BWT randomized round-trip", test_bwt_randomized);
+    run_test("BWT matches a naive suffix sort", test_bwt_matches_naive_sort);
     run_test("MTF round-trip", test_mtf_round_trip);
     run_test("stream codec round-trip", test_stream_codec_round_trip);
     run_test("context mixer and LZP round-trip", test_cm_and_lzp_round_trip);
     run_test("stream LZP round-trip", test_stream_lzp_round_trip);
     run_test("x86 filter round-trip", test_x86_filter_round_trip);
     run_test("x86 flag in archives", test_x86_flag_in_archives);
+    run_test("record filter round-trip", test_record_filter_round_trip);
+    run_test("record flag in archives", test_record_flag_in_archives);
+    run_test("content boundaries", test_content_boundaries);
+    run_test("segmented archives", test_segmented_archives);
     run_test("file round-trip and determinism", test_file_round_trip_and_determinism);
     run_test("block mode selection", test_block_mode_selection);
     run_test("corrupt archive handling", test_corrupt_archives_do_not_replace_output);
@@ -1310,6 +1953,8 @@ int main()
     run_test("directory output rejection", test_directory_output_is_rejected);
     run_test("hostile archive rejection", test_hostile_archives_are_rejected);
     run_test("thread count does not change output", test_thread_count_does_not_change_output);
+    run_test("thread count does not change a single block",
+             test_thread_count_does_not_change_single_block);
     run_test("same input/output rejection", test_same_input_and_output_is_rejected);
 
     if (failure_count != 0)

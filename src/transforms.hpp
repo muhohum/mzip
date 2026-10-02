@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <vector>
@@ -29,7 +30,8 @@ struct BwtResult
 };
 
 [[nodiscard]] BwtResult bwt_encode(std::span<const Byte> input);
-[[nodiscard]] Bytes bwt_decode(std::span<const Byte> input, std::uint32_t primary_index);
+// Restores the block in the buffer that holds the transformed one.
+[[nodiscard]] Bytes bwt_decode(Bytes block, std::uint32_t primary_index);
 
 void mtf_encode(Bytes& data);
 void mtf_decode(Bytes& data);
@@ -54,11 +56,21 @@ rc_encode(std::span<const Byte> input, std::size_t min_extension_run, std::size_
 [[nodiscard]] Bytes cm_decode_v2(std::span<const Byte> payload, std::size_t expected_size);
 
 // LZP: long repeats become marker+length tokens; the stream starts with the marker byte.
+// A repeat becomes a token from min_match bytes on, or from far_match bytes when its source
+// lies at least far_distance bytes back; both sides derive the threshold from the predicted
+// position before the token, so the length stays relative to it.
+struct LzpRule
+{
+    std::size_t min_match = 128;
+    std::size_t far_match = 128;
+    std::size_t far_distance = std::numeric_limits<std::size_t>::max();
+};
+
 // Encode returns nothing unless the stream shrinks; hash_bits sizes the shared table.
-[[nodiscard]] std::optional<Bytes> lzp_encode(std::span<const Byte> input,
-                                              unsigned int hash_bits = 20U);
+[[nodiscard]] std::optional<Bytes>
+lzp_encode(std::span<const Byte> input, unsigned int hash_bits = 20U, const LzpRule& rule = {});
 [[nodiscard]] Bytes lzp_decode(std::span<const Byte> input, std::size_t expected_size,
-                               unsigned int hash_bits = 20U);
+                               unsigned int hash_bits = 20U, const LzpRule& rule = {});
 
 // x86 branch-target filter: the rel32 operand after every E8 (call) and E9 (jmp rel32) opcode
 // becomes an absolute block offset, so repeated calls to one function look alike. Operands
@@ -69,6 +81,34 @@ rc_encode(std::span<const Byte> input, std::size_t min_extension_run, std::size_
 [[nodiscard]] std::size_t x86_branch_targets(std::span<const Byte> data) noexcept;
 std::size_t x86_filter_encode(std::span<Byte> data) noexcept;
 void x86_filter_decode(std::span<Byte> data) noexcept;
+
+// Record filter for tables of fixed-length records and rows of 16-bit samples: chosen units of
+// every record (little-endian integers of `unit` bytes) are replaced by their difference to the
+// same unit one record earlier. The first record and a partial unit at the end stay as they
+// are. Mask bit k (bit k % 8 of byte k / 8) selects unit k of a record.
+struct RecordPlan
+{
+    std::uint32_t stride = 0;
+    std::uint32_t unit = 1;
+    Bytes mask;
+};
+
+// Finds a record length and the units worth delta-coding; nothing when the data shows no
+// record structure or the estimated gain is too small to pay for a candidate.
+[[nodiscard]] std::optional<RecordPlan> record_plan(std::span<const Byte> data);
+void record_filter_encode(std::span<Byte> data, const RecordPlan& plan) noexcept;
+void record_filter_decode(std::span<Byte> data, const RecordPlan& plan) noexcept;
+// The serialized plan: unit width (1, 2, 4 or 8), stride as 16-bit little-endian, then the mask.
+[[nodiscard]] Bytes record_plan_write(const RecordPlan& plan);
+// Parses and validates a plan at the start of `payload` for a block of `block_size` bytes; sets
+// `consumed` to its length. Throws FormatError on a plan that is malformed or cannot apply to
+// the block.
+[[nodiscard]] RecordPlan record_plan_read(std::span<const Byte> payload, std::size_t block_size,
+                                          std::size_t& consumed);
+
+// Offsets, ascending and strictly inside the data, where its statistics change enough that the
+// pieces are expected to code better as blocks of their own; empty for uniform data.
+[[nodiscard]] std::vector<std::size_t> content_boundaries(std::span<const Byte> data);
 
 [[nodiscard]] std::uint32_t adler32(std::span<const Byte> input) noexcept;
 

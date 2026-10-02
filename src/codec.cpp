@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
 #include <optional>
@@ -35,8 +36,10 @@ constexpr std::uint8_t oldest_readable_version = 1U;
 constexpr std::uint64_t file_header_size = 24U;
 constexpr std::uint64_t block_header_size = 24U;
 // Bit 0: tar directory tree. Bit 1: one LZP stream under the blocks; a 16-byte header follows.
+// Bit 2 (version 3 only): blocks may end before the block size where the content changes.
 constexpr Byte archive_flag_directory = 0x01U;
 constexpr Byte archive_flag_stream_lzp = 0x02U;
+constexpr Byte archive_flag_segmented = 0x04U;
 constexpr std::uint64_t stream_header_size = 16U;
 constexpr std::uint64_t stream_lzp_limit = 512ULL * 1024U * 1024U;
 constexpr unsigned int stream_hash_bits_floor = 20U;
@@ -64,9 +67,12 @@ enum class BlockMode : std::uint8_t
 };
 
 // Bit 0 of the block flags: the block bytes went through LZP before the BWT. Bit 1: the x86
-// branch-target filter ran first (version 3 archives only). Both only combine with the mixer.
+// branch-target filter ran first. Bit 2: the record filter ran first, and its plan precedes the
+// mixed payload. Bits 1 and 2 are version 3 only; all three only combine with the mixer, and
+// the record filter with neither of the others.
 constexpr Byte block_flag_lzp = 0x01U;
 constexpr Byte block_flag_x86 = 0x02U;
+constexpr Byte block_flag_record = 0x04U;
 // The x86 candidate is only tried when the filter finds at least one in-block branch target
 // per this many bytes: x86 code has one every 40-70 bytes, while data with incidental E8/E9
 // bytes (and non-x86 code) stays above 1,000 and never gains from the filter.
@@ -77,12 +83,30 @@ constexpr std::size_t x86_dense_bytes_per_target = 256;
 // The per-block LZP candidate is only built when the pass shrinks the block by at least this
 // fraction; a smaller shrink has never paid for the second sort and mix in measurements.
 constexpr std::size_t lzp_shrink_divisor = 256;
+// LZP turns repeats of 128 bytes or more into tokens; shorter ones are left to the block sort,
+// which codes them better than a token does on redundant data. In version 3 the stream pass
+// also takes repeats from this many bytes on when their source lies at least a block back,
+// out of reach of any block's sort.
+constexpr std::size_t stream_lzp_far_match = 32;
+
+[[nodiscard]] detail::LzpRule stream_lzp_rule(const std::uint8_t version,
+                                              const std::uint32_t block_size) noexcept
+{
+    detail::LzpRule rule;
+    if (version >= 3U)
+    {
+        rule.far_match = stream_lzp_far_match;
+        rule.far_distance = block_size;
+    }
+    return rule;
+}
 
 struct BlockHeader
 {
     BlockMode mode = BlockMode::raw;
     bool lzp = false;
     bool x86 = false;
+    bool record = false;
     // Archive version the block was read from; selects the context-mixing model.
     std::uint8_t version = archive_version;
     std::uint32_t original_size = 0;
@@ -335,7 +359,8 @@ void write_block_header(std::ostream& output, const BlockHeader& header)
 {
     write_byte(output, static_cast<Byte>(header.mode));
     write_byte(output, static_cast<Byte>((header.lzp ? block_flag_lzp : Byte{0U}) |
-                                         (header.x86 ? block_flag_x86 : Byte{0U})));
+                                         (header.x86 ? block_flag_x86 : Byte{0U}) |
+                                         (header.record ? block_flag_record : Byte{0U})));
     write_u16(output, 0U);
     write_u32(output, header.original_size);
     write_u32(output, header.payload_size);
@@ -351,9 +376,10 @@ void write_block_header(std::ostream& output, const BlockHeader& header)
     const std::uint16_t reserved_word = read_u16(input, "block flags");
     const Byte mode_limit = version >= 2U ? static_cast<Byte>(BlockMode::mixed)
                                           : static_cast<Byte>(BlockMode::transformed);
-    const Byte flag_limit = version >= 3U   ? static_cast<Byte>(block_flag_lzp | block_flag_x86)
-                            : version >= 2U ? block_flag_lzp
-                                            : Byte{0U};
+    const Byte flag_limit =
+        version >= 3U   ? static_cast<Byte>(block_flag_lzp | block_flag_x86 | block_flag_record)
+        : version >= 2U ? block_flag_lzp
+                        : Byte{0U};
     if ((flags & static_cast<Byte>(~flag_limit)) != 0U || reserved_word != 0U)
     {
         throw FormatError("unsupported block flags");
@@ -368,6 +394,7 @@ void write_block_header(std::ostream& output, const BlockHeader& header)
     header.mode = static_cast<BlockMode>(mode_value);
     header.lzp = (flags & block_flag_lzp) != 0U;
     header.x86 = (flags & block_flag_x86) != 0U;
+    header.record = (flags & block_flag_record) != 0U;
     header.original_size = read_u32(input, "block size");
     header.payload_size = read_u32(input, "payload size");
     header.primary_index = read_u32(input, "BWT index");
@@ -529,27 +556,36 @@ struct BlockCandidate
     std::uint32_t intermediate = 0;
     bool lzp_used = false;
     bool x86_used = false;
+    bool record_used = false;
     if (thorough || !x86_dense)
     {
         best = encode_candidate(original, original.size());
         intermediate = best.context_mixed ? 0U : best.symbol_count;
     }
 
-    // Context-mixes one more pre-transformed stream and keeps it when it beats the best so far.
-    const auto try_mixed = [&](const Bytes& stream, const bool lzp, const bool x86)
+    // Context-mixes one more pre-transformed stream, after `prefix` (the record filter plan),
+    // and keeps it when it beats the best so far.
+    const auto try_mixed =
+        [&](const Bytes& stream, const bool lzp, const bool x86, const Bytes& prefix = Bytes())
     {
         const std::size_t limit =
             best.payload ? std::min(original.size(), best.payload->size()) : original.size();
-        detail::BwtResult bwt = detail::bwt_encode(stream);
-        std::optional<Bytes> mixed = detail::cm_encode(bwt.data, limit);
-        if (mixed && (!best.payload || mixed->size() < best.payload->size()))
+        if (prefix.size() >= limit)
         {
+            return;
+        }
+        detail::BwtResult bwt = detail::bwt_encode(stream);
+        std::optional<Bytes> mixed = detail::cm_encode(bwt.data, limit - prefix.size());
+        if (mixed && (!best.payload || prefix.size() + mixed->size() < best.payload->size()))
+        {
+            mixed->insert(mixed->begin(), prefix.begin(), prefix.end());
             best.payload = std::move(mixed);
             best.primary_index = bwt.primary_index;
             best.context_mixed = true;
             intermediate = lzp ? narrow_size(stream.size(), "LZP intermediate stream") : 0U;
             lzp_used = lzp;
             x86_used = x86;
+            record_used = !prefix.empty();
         }
     };
 
@@ -578,12 +614,19 @@ struct BlockCandidate
             try_mixed(*lzp, true, true);
         }
     }
+    if (const std::optional<detail::RecordPlan> plan = detail::record_plan(original))
+    {
+        Bytes filtered = original;
+        detail::record_filter_encode(filtered, *plan);
+        try_mixed(filtered, false, false, detail::record_plan_write(*plan));
+    }
 
     if (best.payload && best.payload->size() < original.size())
     {
         result.header.mode = best.context_mixed ? BlockMode::mixed : BlockMode::transformed;
         result.header.lzp = lzp_used;
         result.header.x86 = x86_used;
+        result.header.record = record_used;
         result.header.payload_size = narrow_size(best.payload->size(), "block payload");
         result.header.primary_index = best.primary_index;
         result.header.intermediate_size = intermediate;
@@ -605,6 +648,11 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
         throw std::runtime_error("failed while writing compressed output");
     }
     increment_mode_count(stats, block.header.mode);
+    if (stats.block_count == std::numeric_limits<std::uint32_t>::max())
+    {
+        throw std::runtime_error("input requires too many blocks for the MZIP format");
+    }
+    ++stats.block_count;
 }
 
 [[nodiscard]] Bytes decode_block(const BlockHeader& header, Bytes payload)
@@ -614,7 +662,7 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
     {
     case BlockMode::raw:
         if (header.payload_size != header.original_size || header.primary_index != 0U ||
-            header.intermediate_size != 0U || header.lzp || header.x86)
+            header.intermediate_size != 0U || header.lzp || header.x86 || header.record)
         {
             throw FormatError("raw block contains transform metadata");
         }
@@ -626,14 +674,14 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
         // Run symbols consume at least one MTF byte each.
         if (header.primary_index == 0U || header.primary_index > header.original_size ||
             header.intermediate_size == 0U || header.intermediate_size > header.original_size ||
-            header.lzp || header.x86)
+            header.lzp || header.x86 || header.record)
         {
             throw FormatError("invalid transformed block metadata");
         }
         Bytes mtf = detail::rc_decode(payload, header.intermediate_size, header.original_size);
         payload = Bytes();
         detail::mtf_decode(mtf);
-        decoded = detail::bwt_decode(mtf, header.primary_index);
+        decoded = detail::bwt_decode(std::move(mtf), header.primary_index);
         break;
     }
 
@@ -644,21 +692,33 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
             header.lzp ? header.intermediate_size : header.original_size;
         if (header.primary_index == 0U || header.primary_index > coded_size ||
             (header.lzp ? header.intermediate_size >= header.original_size
-                        : header.intermediate_size != 0U))
+                        : header.intermediate_size != 0U) ||
+            (header.record && (header.lzp || header.x86)))
         {
             throw FormatError("invalid mixed block metadata");
         }
-        Bytes coded = header.version >= 3U ? detail::cm_decode(payload, coded_size)
-                                           : detail::cm_decode_v2(payload, coded_size);
+        // The record filter plan opens the payload; the coded stream follows it.
+        std::optional<detail::RecordPlan> plan;
+        std::size_t plan_size = 0;
+        if (header.record)
+        {
+            plan = detail::record_plan_read(payload, header.original_size, plan_size);
+        }
+        const std::span<const Byte> mixed = std::span<const Byte>(payload).subspan(plan_size);
+        Bytes coded = header.version >= 3U ? detail::cm_decode(mixed, coded_size)
+                                           : detail::cm_decode_v2(mixed, coded_size);
         payload = Bytes();
-        Bytes stream = detail::bwt_decode(coded, header.primary_index);
-        coded = Bytes();
+        Bytes stream = detail::bwt_decode(std::move(coded), header.primary_index);
         decoded = header.lzp ? detail::lzp_decode(stream, header.original_size,
                                                   stream_hash_bits(header.original_size))
                              : std::move(stream);
         if (header.x86)
         {
             detail::x86_filter_decode(decoded);
+        }
+        if (plan)
+        {
+            detail::record_filter_decode(decoded, *plan);
         }
         break;
     }
@@ -690,87 +750,125 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
     return total;
 }
 
-// Same ordered window pipeline as the streaming path, over an in-memory stream.
-[[nodiscard]] std::vector<EncodedBlock> encode_buffered(const Bytes& data,
-                                                        const std::uint32_t block_size,
-                                                        const std::uint32_t thread_count,
-                                                        const bool thorough)
+// Encodes blocks on worker threads, at most `window` at a time, and hands the results to the
+// sink in submission order, so the archive never depends on scheduling. A window of one
+// encodes on the calling thread.
+class EncodePipeline
 {
-    const std::uint32_t block_count = expected_block_count(data.size(), block_size);
-    std::vector<EncodedBlock> encoded;
-    encoded.reserve(block_count);
-    const auto slice = [&](const std::uint32_t index)
+public:
+    EncodePipeline(const std::size_t window, const bool thorough,
+                   std::function<void(EncodedBlock)> sink)
+        : window_(window), thorough_(thorough), sink_(std::move(sink))
     {
-        const std::size_t begin = static_cast<std::size_t>(index) * block_size;
-        const std::size_t end = std::min(data.size(), begin + block_size);
-        return Bytes(data.begin() + static_cast<std::ptrdiff_t>(begin),
-                     data.begin() + static_cast<std::ptrdiff_t>(end));
-    };
-
-    const std::size_t window = pipeline_window(block_size, thread_count);
-    if (window <= 1U || block_count <= 1U)
-    {
-        for (std::uint32_t index = 0; index < block_count; ++index)
-        {
-            encoded.push_back(encode_block(slice(index), thorough));
-        }
-        return encoded;
     }
 
-    struct InFlightBlock
-    {
-        std::thread worker;
-        std::future<EncodedBlock> result;
-    };
-    std::deque<InFlightBlock> in_flight;
-    const auto drain_front = [&]
-    {
-        InFlightBlock front = std::move(in_flight.front());
-        in_flight.pop_front();
-        front.worker.join();
-        encoded.push_back(front.result.get());
-    };
+    EncodePipeline(const EncodePipeline&) = delete;
+    EncodePipeline& operator=(const EncodePipeline&) = delete;
 
-    try
+    ~EncodePipeline()
     {
-        for (std::uint32_t index = 0; index < block_count; ++index)
-        {
-            if (in_flight.size() >= window)
-            {
-                drain_front();
-            }
-            std::packaged_task<EncodedBlock()> task(
-                [block = slice(index), thorough]() mutable
-                { return encode_block(std::move(block), thorough); });
-            in_flight.emplace_back();
-            InFlightBlock& slot = in_flight.back();
-            slot.result = task.get_future();
-            try
-            {
-                slot.worker = std::thread(std::move(task));
-            }
-            catch (...)
-            {
-                in_flight.pop_back();
-                throw;
-            }
-        }
-        while (!in_flight.empty())
-        {
-            drain_front();
-        }
-    }
-    catch (...)
-    {
-        for (InFlightBlock& block : in_flight)
+        for (InFlightBlock& block : in_flight_)
         {
             if (block.worker.joinable())
             {
                 block.worker.join();
             }
         }
-        throw;
     }
+
+    // Submits one block-sized chunk of the stream. Where its content changes part-way, say
+    // from machine code to tables or from one embedded file to the next, every piece becomes
+    // a block of its own: unlike data sorted and modelled together codes worse than apart.
+    void submit_chunk(Bytes chunk)
+    {
+        std::size_t begin = 0;
+        for (const std::size_t cut : detail::content_boundaries(chunk))
+        {
+            submit(Bytes(chunk.begin() + static_cast<std::ptrdiff_t>(begin),
+                         chunk.begin() + static_cast<std::ptrdiff_t>(cut)));
+            begin = cut;
+        }
+        if (begin != 0U)
+        {
+            chunk.erase(chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(begin));
+        }
+        submit(std::move(chunk));
+    }
+
+    void finish()
+    {
+        while (!in_flight_.empty())
+        {
+            drain_front();
+        }
+    }
+
+private:
+    struct InFlightBlock
+    {
+        std::thread worker;
+        std::future<EncodedBlock> result;
+    };
+
+    void submit(Bytes block)
+    {
+        if (window_ <= 1U)
+        {
+            sink_(encode_block(std::move(block), thorough_));
+            return;
+        }
+        if (in_flight_.size() >= window_)
+        {
+            drain_front();
+        }
+        std::packaged_task<EncodedBlock()> task(
+            [block = std::move(block), thorough = thorough_]() mutable
+            { return encode_block(std::move(block), thorough); });
+        in_flight_.emplace_back();
+        InFlightBlock& slot = in_flight_.back();
+        slot.result = task.get_future();
+        try
+        {
+            slot.worker = std::thread(std::move(task));
+        }
+        catch (...)
+        {
+            in_flight_.pop_back();
+            throw;
+        }
+    }
+
+    void drain_front()
+    {
+        InFlightBlock front = std::move(in_flight_.front());
+        in_flight_.pop_front();
+        front.worker.join();
+        sink_(front.result.get());
+    }
+
+    std::size_t window_;
+    bool thorough_;
+    std::function<void(EncodedBlock)> sink_;
+    std::deque<InFlightBlock> in_flight_;
+};
+
+// The pipeline over an in-memory stream.
+[[nodiscard]] std::vector<EncodedBlock> encode_buffered(const Bytes& data,
+                                                        const std::uint32_t block_size,
+                                                        const std::uint32_t thread_count,
+                                                        const bool thorough)
+{
+    std::vector<EncodedBlock> encoded;
+    EncodePipeline pipeline(pipeline_window(block_size, thread_count), thorough,
+                            [&encoded](EncodedBlock block)
+                            { encoded.push_back(std::move(block)); });
+    for (std::size_t begin = 0; begin < data.size(); begin += block_size)
+    {
+        const std::size_t end = std::min<std::size_t>(data.size(), begin + block_size);
+        pipeline.submit_chunk(Bytes(data.begin() + static_cast<std::ptrdiff_t>(begin),
+                                    data.begin() + static_cast<std::ptrdiff_t>(end)));
+    }
+    pipeline.finish();
     return encoded;
 }
 
@@ -898,7 +996,8 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
     {
         stream_checksum = detail::adler32(buffer);
         stream_bits = stream_hash_bits(input_size);
-        std::optional<Bytes> collapsed = detail::lzp_encode(buffer, stream_bits);
+        std::optional<Bytes> collapsed =
+            detail::lzp_encode(buffer, stream_bits, stream_lzp_rule(archive_version, block_size));
         if (collapsed && collapsed->size() < buffer.size() - buffer.size() / 10U)
         {
             buffer = std::move(*collapsed);
@@ -951,7 +1050,6 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
 
     CompressionStats stats;
     stats.input_size = input_size;
-    stats.block_count = block_count;
 
     if (buffered)
     {
@@ -994,77 +1092,17 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
             remaining -= current_size;
         };
 
-        const std::size_t window = pipeline_window(block_size, thread_count);
-        if (window <= 1U || block_count <= 1U)
+        // Read in order, encode in parallel, write in order.
+        EncodePipeline pipeline(pipeline_window(block_size, thread_count), thorough,
+                                [&](const EncodedBlock& block)
+                                { write_encoded_block(output, block, stats); });
+        for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
         {
-            for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
-            {
-                Bytes original;
-                read_block(original);
-                write_encoded_block(output, encode_block(std::move(original), thorough), stats);
-            }
+            Bytes original;
+            read_block(original);
+            pipeline.submit_chunk(std::move(original));
         }
-        else
-        {
-            // Read in order, encode in parallel, write in order.
-            struct InFlightBlock
-            {
-                std::thread worker;
-                std::future<EncodedBlock> result;
-            };
-            std::deque<InFlightBlock> in_flight;
-            const auto drain_front = [&]
-            {
-                InFlightBlock front = std::move(in_flight.front());
-                in_flight.pop_front();
-                front.worker.join();
-                const EncodedBlock block = front.result.get();
-                write_encoded_block(output, block, stats);
-            };
-
-            try
-            {
-                for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
-                {
-                    if (in_flight.size() >= window)
-                    {
-                        drain_front();
-                    }
-                    Bytes original;
-                    read_block(original);
-                    std::packaged_task<EncodedBlock()> task(
-                        [block = std::move(original), thorough]() mutable
-                        { return encode_block(std::move(block), thorough); });
-                    in_flight.emplace_back();
-                    InFlightBlock& slot = in_flight.back();
-                    slot.result = task.get_future();
-                    try
-                    {
-                        slot.worker = std::thread(std::move(task));
-                    }
-                    catch (...)
-                    {
-                        in_flight.pop_back();
-                        throw;
-                    }
-                }
-                while (!in_flight.empty())
-                {
-                    drain_front();
-                }
-            }
-            catch (...)
-            {
-                for (InFlightBlock& block : in_flight)
-                {
-                    if (block.worker.joinable())
-                    {
-                        block.worker.join();
-                    }
-                }
-                throw;
-            }
-        }
+        pipeline.finish();
 
         if (tar_source)
         {
@@ -1080,6 +1118,14 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
         }
     }
 
+    // Chunks cut at content boundaries left more blocks than the header announced.
+    if (stats.block_count != block_count)
+    {
+        output.seekp(static_cast<std::streamoff>(archive_magic.size()) + 1);
+        write_byte(output, static_cast<Byte>(flags | archive_flag_segmented));
+        output.seekp(static_cast<std::streamoff>(file_header_size) - 4);
+        write_u32(output, stats.block_count);
+    }
     output.close();
     if (!output)
     {
@@ -1138,14 +1184,17 @@ CompressionStats decompress_file(const std::filesystem::path& input_path,
     const Byte flags = read_byte(input, "archive flags");
     const std::uint16_t reserved = read_u16(input, "archive flags");
     const Byte flag_limit =
-        version >= 2U ? static_cast<Byte>(archive_flag_directory | archive_flag_stream_lzp)
-                      : archive_flag_directory;
+        version >= 3U   ? static_cast<Byte>(archive_flag_directory | archive_flag_stream_lzp |
+                                            archive_flag_segmented)
+        : version >= 2U ? static_cast<Byte>(archive_flag_directory | archive_flag_stream_lzp)
+                        : archive_flag_directory;
     if ((flags & static_cast<Byte>(~flag_limit)) != 0U || reserved != 0U)
     {
         throw FormatError("unsupported MZIP archive flags");
     }
     const bool directory_output = (flags & archive_flag_directory) != 0U;
     const bool stream_lzp = (flags & archive_flag_stream_lzp) != 0U;
+    const bool segmented = (flags & archive_flag_segmented) != 0U;
 
     const std::uint32_t block_size = read_u32(input, "archive block size");
     try
@@ -1192,7 +1241,9 @@ CompressionStats decompress_file(const std::filesystem::path& input_path,
     {
         throw FormatError(error.what());
     }
-    if (block_count != calculated_block_count)
+    // Blocks that end early add to the count, but every block restores at least one byte.
+    if (segmented ? (block_count < calculated_block_count || block_count > coded_size)
+                  : block_count != calculated_block_count)
     {
         throw FormatError("archive block count does not match its original size");
     }
@@ -1255,7 +1306,8 @@ CompressionStats decompress_file(const std::filesystem::path& input_path,
         const BlockHeader header = read_block_header(input, version);
         const std::uint32_t expected_size =
             static_cast<std::uint32_t>(std::min<std::uint64_t>(remaining, block_size));
-        if (header.original_size != expected_size || header.original_size == 0U)
+        if (header.original_size == 0U || header.original_size > expected_size ||
+            (!segmented && header.original_size != expected_size))
         {
             throw FormatError("block has an unexpected original size");
         }
@@ -1378,8 +1430,9 @@ CompressionStats decompress_file(const std::filesystem::path& input_path,
 
         if (stream_lzp)
         {
-            Bytes restored = detail::lzp_decode(
-                stream_buffer, static_cast<std::size_t>(original_size), stream_bits);
+            Bytes restored =
+                detail::lzp_decode(stream_buffer, static_cast<std::size_t>(original_size),
+                                   stream_bits, stream_lzp_rule(version, block_size));
             stream_buffer = Bytes();
             if (detail::adler32(restored) != stream_checksum)
             {
