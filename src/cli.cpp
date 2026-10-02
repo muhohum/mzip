@@ -28,11 +28,11 @@ void print_usage(std::ostream& output)
            << "The input may be a file or a directory; a directory archive extracts back into"
               " a directory.\n"
            << "Block size: " << mzip::minimum_block_size << ".." << mzip::maximum_block_size
-           << " bytes; 0 or omitted picks one from the input size.\n"
+           << " bytes; 0 or omitted uses 16 MiB blocks (or one block with --profile ratio).\n"
            << "Threads: 0 selects the hardware concurrency (default). Output does not depend on"
               " the thread count.\n"
            << "Profiles: default (balanced), ratio (one block over the whole input, up to"
-              " 1 GiB; more memory).\n";
+              " 1 GiB, no coding shortcuts; slower, more memory).\n";
 }
 
 [[nodiscard]] std::uint32_t parse_number(const std::string_view text, const char* description)

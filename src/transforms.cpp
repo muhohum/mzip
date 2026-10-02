@@ -4,12 +4,18 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+#include <intrin.h> // _mm_prefetch
+#endif
 
 namespace mzip::detail
 {
@@ -805,6 +811,705 @@ Bytes rc_decode(const std::span<const Byte> payload, const std::size_t symbol_co
 namespace
 {
 
+// ---- Context mixing over BWT output ----------------------------------------------------------
+//
+// Each bit of a byte is predicted by adaptive counters under several contexts, blended in the
+// logistic domain by two small gated linear networks, refined by two secondary estimation
+// stages, and coded with a carryless binary arithmetic coder. Everything is integer
+// arithmetic, so the model evolves identically on every platform.
+
+// The per-bit model steps must inline into the coder loops to keep their state in registers;
+// optimisers decline that on their own at moderate settings, so ask explicitly where the
+// compiler lets us. A pure hint: the output is the same.
+#if defined(_MSC_VER)
+#define MZIP_CM_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define MZIP_CM_INLINE inline __attribute__((always_inline))
+#else
+#define MZIP_CM_INLINE inline
+#endif
+
+// Hints that a cache line will be needed soon; purely advisory and a no-op where unsupported.
+// (Inlined by force: a call whose only effect is a prefetch may otherwise be dropped.)
+MZIP_CM_INLINE void prefetch([[maybe_unused]] const void* address) noexcept
+{
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(address);
+#elif defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+    _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#endif
+}
+
+// stretch(p) = ln(p / (1 - p)) with +-2047 spanning +-8 nats; squash is its inverse. 12-bit.
+constexpr int logistic_limit = 2047;
+constexpr std::array<int, 33> squash_knots{1,    2,    3,    6,    10,   16,   27,   45,   73,
+                                           120,  194,  310,  488,  747,  1101, 1546, 2047, 2549,
+                                           2994, 3348, 3607, 3785, 3901, 3975, 4024, 4050, 4068,
+                                           4079, 4085, 4089, 4092, 4093, 4094};
+
+[[nodiscard]] constexpr int squash(const int value) noexcept
+{
+    if (value > logistic_limit)
+    {
+        return 4095;
+    }
+    if (value < -logistic_limit)
+    {
+        return 0;
+    }
+    const int weight = value & 127;
+    const std::size_t knot = static_cast<std::size_t>((value >> 7) + 16);
+    return (squash_knots[knot] * (128 - weight) + squash_knots[knot + 1U] * weight + 64) >> 7;
+}
+
+[[nodiscard]] constexpr std::array<std::int16_t, 4096> make_stretch_table() noexcept
+{
+    std::array<std::int16_t, 4096> table{};
+    std::size_t filled = 0;
+    for (int value = -logistic_limit; value <= logistic_limit; ++value)
+    {
+        const auto probability = static_cast<std::size_t>(squash(value));
+        for (std::size_t index = filled; index <= probability; ++index)
+        {
+            table[index] = static_cast<std::int16_t>(value);
+        }
+        filled = std::max(filled, probability + 1U);
+    }
+    for (std::size_t index = filled; index < table.size(); ++index)
+    {
+        table[index] = logistic_limit;
+    }
+    return table;
+}
+
+constexpr std::array<std::int16_t, 4096> stretch_table = make_stretch_table();
+
+[[nodiscard]] inline int stretch(const int probability) noexcept
+{
+    return stretch_table[static_cast<std::size_t>(probability)];
+}
+
+// squash over the clamped domain as a single lookup, with the same values as squash().
+[[nodiscard]] constexpr std::array<std::int16_t, 2 * logistic_limit + 1>
+make_squash_table() noexcept
+{
+    std::array<std::int16_t, 2 * logistic_limit + 1> table{};
+    for (int value = -logistic_limit; value <= logistic_limit; ++value)
+    {
+        table[static_cast<std::size_t>(value + logistic_limit)] =
+            static_cast<std::int16_t>(squash(value));
+    }
+    return table;
+}
+
+constexpr std::array<std::int16_t, 2 * logistic_limit + 1> squash_table = make_squash_table();
+
+// squash(value) for a value already within +-logistic_limit.
+[[nodiscard]] inline int squash_in_domain(const int value) noexcept
+{
+    return squash_table[static_cast<std::size_t>(value + logistic_limit)];
+}
+
+// Two kinds of counter cell predict a bit under a context.
+//
+// A 32-bit adaptive cell holds a 22-bit probability over a 10-bit hit count. Its step shrinks
+// with the count, so a context seen for the first time learns quickly and then settles down
+// to 1/(2 * limit + offset). It pays for the sparsely visited tables.
+//
+// A 16-bit fixed cell holds a probability only and moves by a fixed shift. It suits the small,
+// densely visited tables, where every context is seen often enough that a fixed rate matches
+// an adaptive one, at half the memory and a cheaper update.
+[[nodiscard]] constexpr std::array<std::int32_t, 1024> make_counter_rates() noexcept
+{
+    std::array<std::int32_t, 1024> rates{};
+    for (std::size_t count = 0; count < rates.size(); ++count)
+    {
+        rates[count] = static_cast<std::int32_t>(16384U / (2U * count + 3U));
+    }
+    return rates;
+}
+
+constexpr std::array<std::int32_t, 1024> counter_rates = make_counter_rates();
+constexpr std::uint32_t adaptive_initial = 1U << 31U;
+constexpr std::uint16_t fixed_initial = 1U << 15U;
+
+[[nodiscard]] inline int counter_probability(const std::uint32_t cell) noexcept
+{
+    return static_cast<int>(cell >> 20U);
+}
+
+inline void counter_update(std::uint32_t& cell, const unsigned int bit,
+                           const std::uint32_t limit) noexcept
+{
+    const std::uint32_t count = cell & 1023U;
+    const auto probability = static_cast<std::int64_t>(cell >> 10U);
+    const std::int64_t target = static_cast<std::int64_t>(bit) << 22U;
+    const std::int64_t updated =
+        probability + (((target - probability) * counter_rates[count]) >> 14U);
+    cell = (static_cast<std::uint32_t>(updated) << 10U) | std::min(count + 1U, limit);
+}
+
+[[nodiscard]] inline int counter_probability(const std::uint16_t cell) noexcept
+{
+    return static_cast<int>(cell >> 4U);
+}
+
+inline void counter_update(std::uint16_t& cell, const unsigned int bit,
+                           const unsigned int shift) noexcept
+{
+    if (bit != 0U)
+    {
+        cell = static_cast<std::uint16_t>(cell + ((cell ^ 0xFFFFU) >> shift));
+    }
+    else
+    {
+        cell = static_cast<std::uint16_t>(cell - (cell >> shift));
+    }
+}
+
+// Gated linear mixing in the logistic domain; one weight vector per selector value. The
+// per-bit steps are static and act on the caller's copy of the inputs, so that copy can stay
+// in registers; the loops are fold expressions so they unroll at any optimisation level.
+template <std::size_t Inputs> class Mixer
+{
+public:
+    using InputArray = std::array<int, Inputs>;
+
+    Mixer(const std::size_t selectors, const InputArray& initial_weights)
+        : weights_(selectors * Inputs)
+    {
+        for (std::size_t selector = 0; selector < selectors; ++selector)
+        {
+            std::copy(initial_weights.begin(), initial_weights.end(),
+                      weights_.begin() + static_cast<std::ptrdiff_t>(selector * Inputs));
+        }
+    }
+
+    // The weight vector of `selector`; those of the following selectors come right after it.
+    [[nodiscard]] std::int32_t* weights(const std::size_t selector) noexcept
+    {
+        return &weights_[selector * Inputs];
+    }
+
+    // The mixed estimate in the logistic domain (+-2047).
+    [[nodiscard]] static MZIP_CM_INLINE int mix(const std::int32_t* weights,
+                                                const InputArray& inputs) noexcept
+    {
+        const std::int64_t dot = dot_product(weights, inputs, std::make_index_sequence<Inputs>{});
+        return static_cast<int>(
+            std::clamp<std::int64_t>(dot >> 16U, -logistic_limit, logistic_limit));
+    }
+
+    // `probability` is squash() of what mix() returned for these weights. `rate` is in
+    // sixteenths: 16 moves a weight by (input * error) >> 13 per bit, and must keep every
+    // input * error product within 32 bits (see the check next to mixer_rate).
+    static MZIP_CM_INLINE void update(std::int32_t* weights, const InputArray& inputs,
+                                      const int probability, const unsigned int bit,
+                                      const int rate) noexcept
+    {
+        const int error = ((static_cast<int>(bit) << 12U) - probability) * rate;
+        update_weights(weights, inputs, error, std::make_index_sequence<Inputs>{});
+    }
+
+private:
+    static constexpr std::int32_t weight_limit = 1 << 22U;
+
+    template <std::size_t... Index>
+    [[nodiscard]] static MZIP_CM_INLINE std::int64_t
+    dot_product(const std::int32_t* weights, const InputArray& inputs,
+                std::index_sequence<Index...>) noexcept
+    {
+        return ((static_cast<std::int64_t>(inputs[Index]) * weights[Index]) + ...);
+    }
+
+    template <std::size_t... Index>
+    static MZIP_CM_INLINE void update_weights(std::int32_t* weights, const InputArray& inputs,
+                                              const int error,
+                                              std::index_sequence<Index...>) noexcept
+    {
+        ((weights[Index] = std::clamp(weights[Index] + ((inputs[Index] * error) >> 17U),
+                                      -weight_limit, weight_limit)),
+         ...);
+    }
+
+    std::vector<std::int32_t> weights_;
+};
+
+// Secondary estimation: maps a logistic-domain estimate to a refined 16-bit probability
+// under a context, by interpolating 33 adaptive cells spread over the domain.
+class Apm
+{
+public:
+    // One spare context at the end keeps prefetches past the last context in bounds.
+    explicit Apm(const std::size_t contexts) : cells_((contexts + 1U) * cells_per_context)
+    {
+        for (std::size_t context = 0; context <= contexts; ++context)
+        {
+            for (std::size_t step = 0; step < cells_per_context; ++step)
+            {
+                cells_[context * cells_per_context + step] =
+                    static_cast<std::uint16_t>(squash((static_cast<int>(step) - 16) * 128) * 16);
+            }
+        }
+    }
+
+    // The cells of `context`; those of the following contexts come right after them.
+    [[nodiscard]] std::uint16_t* context(const std::size_t index) noexcept
+    {
+        return &cells_[index * cells_per_context];
+    }
+
+    // The pair of cells around `position` (the domain value + 2048) within `cells`.
+    [[nodiscard]] static MZIP_CM_INLINE std::uint16_t* pair(std::uint16_t* cells,
+                                                            const int position) noexcept
+    {
+        return cells + (position >> 7);
+    }
+
+    // Interpolates between a pair of cells; `fraction` is the position within the pair.
+    [[nodiscard]] static MZIP_CM_INLINE int refine(const std::uint16_t* pair,
+                                                   const int fraction) noexcept
+    {
+        return ((pair[0] << 7U) + (pair[1] - pair[0]) * fraction) >> 7;
+    }
+
+    // The value cells move towards after `bit`, shared by every stage.
+    [[nodiscard]] static constexpr int target(const unsigned int bit) noexcept
+    {
+        return (static_cast<int>(bit) << 16U) + (static_cast<int>(bit) << rate) -
+               static_cast<int>(bit) - static_cast<int>(bit);
+    }
+
+    static MZIP_CM_INLINE void update(std::uint16_t* pair, const int target) noexcept
+    {
+        pair[0] = static_cast<std::uint16_t>(pair[0] + ((target - pair[0]) >> rate));
+        pair[1] = static_cast<std::uint16_t>(pair[1] + ((target - pair[1]) >> rate));
+    }
+
+    static constexpr std::size_t cells_per_context = 33;
+
+private:
+    static constexpr int rate = 7;
+
+    std::vector<std::uint16_t> cells_;
+};
+
+// A context's cells, laid out so that the cells one nibble can touch sit together: the first
+// nibble uses cells 1..15 of block 0 and the second, after high nibble h, cells 1..15 of block
+// h + 1, each block being 16 cells. Every node still has a cell of its own, so predictions
+// are unchanged; only their placement is. A context therefore spans 17 blocks, and the storage
+// is aligned so that no block straddles a 64-byte cache line.
+constexpr std::size_t context_cells = 17U * 16U;
+
+template <typename Cell> class NibbleTable
+{
+public:
+    NibbleTable(const std::size_t contexts, const Cell initial)
+        : storage_(contexts * context_cells + line_bytes / sizeof(Cell), initial)
+    {
+        const auto address = reinterpret_cast<std::uintptr_t>(storage_.data());
+        const std::uintptr_t padding = (line_bytes - address % line_bytes) % line_bytes;
+        cells_ = storage_.data() + padding / sizeof(Cell);
+    }
+
+    NibbleTable(const NibbleTable&) = delete;
+    NibbleTable& operator=(const NibbleTable&) = delete;
+
+    [[nodiscard]] Cell* context(const std::size_t index) noexcept
+    {
+        return cells_ + index * context_cells;
+    }
+
+private:
+    static constexpr std::size_t line_bytes = 64;
+
+    std::vector<Cell> storage_;
+    Cell* cells_ = nullptr;
+};
+
+// Where each node's cell sits within a context, in the layout described above.
+[[nodiscard]] constexpr std::array<std::uint16_t, 256> make_node_slots() noexcept
+{
+    std::array<std::uint16_t, 256> slots{};
+    for (unsigned int node = 1; node < 256U; ++node)
+    {
+        if (node < 16U)
+        {
+            slots[node] = static_cast<std::uint16_t>(node);
+            continue;
+        }
+        // node = (16 + high) << depth | partial, with `depth` bits of the second nibble known.
+        const unsigned int depth = static_cast<unsigned int>(std::bit_width(node)) - 5U;
+        const unsigned int high = (node >> depth) & 15U;
+        const unsigned int partial = node & ((1U << depth) - 1U);
+        slots[node] = static_cast<std::uint16_t>(((high + 1U) << 4U) | (1U << depth) | partial);
+    }
+    return slots;
+}
+
+constexpr std::array<std::uint16_t, 256> node_slots = make_node_slots();
+
+// A bit history is the last bits coded under one context, newest in the low bit, behind a
+// leading 1 that marks its length. 1 is the empty history; seven bits is the most it keeps.
+constexpr std::uint8_t history_empty = 1;
+
+[[nodiscard]] constexpr std::uint8_t history_push(const std::uint8_t history,
+                                                  const unsigned int bit) noexcept
+{
+    const unsigned int shifted = (static_cast<unsigned int>(history) << 1U) | bit;
+    return static_cast<std::uint8_t>(shifted < 256U ? shifted : (shifted & 127U) | 128U);
+}
+
+// Indirect model: keeps a bit history per context and learns, across all contexts, what each
+// history says about the next bit. Where a direct counter has to be dragged toward a change,
+// the map already knows that "1110" tends to continue with 0 or that "0101" alternates.
+class HistoryModel
+{
+public:
+    explicit HistoryModel(const std::size_t contexts)
+        : histories_(contexts, history_empty), map_(256U, adaptive_initial)
+    {
+    }
+
+    // The histories kept under `context`, one per node slot.
+    [[nodiscard]] std::uint8_t* context(const std::size_t index) noexcept
+    {
+        return histories_.context(index);
+    }
+
+    // The counter that says what `history` tends to continue with.
+    [[nodiscard]] MZIP_CM_INLINE std::uint32_t* cell(const std::uint8_t history) noexcept
+    {
+        return &map_[history];
+    }
+
+private:
+    NibbleTable<std::uint8_t> histories_;
+    std::vector<std::uint32_t> map_;
+};
+
+// Model parameters. Fixed cells adapt by 1/2^shift; the count limit of an adaptive cell sets
+// how slowly a seasoned context adapts; the mixer rate is in sixteenths.
+constexpr unsigned int order0_shift = 2;
+constexpr unsigned int sparse_shift = 4;
+constexpr std::uint32_t history_limit = 30;
+constexpr std::uint32_t slow_limit = 1023;
+constexpr std::uint32_t order2_limit = 20;
+constexpr std::uint32_t run_limit = 80;
+constexpr int mixer_rate = 32;
+// The mixer update multiplies a 12-bit input by error * rate in 32 bits.
+static_assert(std::int64_t{logistic_limit} * 4095 * mixer_rate < (std::int64_t{1} << 31U),
+              "mixer_rate is too large for the mixer's 32-bit update");
+constexpr std::int32_t mixer_initial_weight = 13107;
+constexpr unsigned int order2_bits_floor = 16;
+constexpr unsigned int order2_bits_ceiling = 22;
+constexpr std::size_t mixer_inputs = 6;
+// Run lengths are exact below 4 and share a bucket per doubling above that.
+constexpr unsigned int run_exact_bits = 2;
+constexpr std::size_t run_buckets = 12;
+constexpr std::size_t run_classes = 4;
+
+// Order-2 contexts are hashed into a table sized from the block.
+[[nodiscard]] unsigned int order2_bits(const std::size_t block_size) noexcept
+{
+    const auto width = static_cast<unsigned int>(std::bit_width(block_size | 1U));
+    return std::clamp(width + 4U, order2_bits_floor, order2_bits_ceiling);
+}
+
+[[nodiscard]] constexpr unsigned int run_bucket_of(const unsigned int run) noexcept
+{
+    constexpr unsigned int exact = 1U << run_exact_bits;
+    if (run < exact)
+    {
+        return run;
+    }
+    const auto doubling =
+        exact - 1U + static_cast<unsigned int>(std::bit_width(run >> run_exact_bits));
+    return std::min(doubling, static_cast<unsigned int>(run_buckets) - 1U);
+}
+
+// Coarse run-length class (1, 2-3, 4-15, 16 and longer) that selects the mixer weights.
+[[nodiscard]] constexpr unsigned int run_class_of(const unsigned int run) noexcept
+{
+    const auto width = static_cast<unsigned int>(std::bit_width(run));
+    return width <= 1U ? 0U : width == 2U ? 1U : width <= 4U ? 2U : 3U;
+}
+
+// BWT output is runs of a few alternating symbols. The contexts are the previous byte c1, the
+// byte before it c2, the symbol d1 that preceded the current run (inside a run c2 == c1 adds
+// nothing to c1, while d1 keeps a real second symbol of context), and the run length.
+class MixedModel
+{
+public:
+    using Inputs = Mixer<mixer_inputs>::InputArray;
+
+    // What predict() finds for one bit and update() needs again, passed by value so that the
+    // compiler may keep it in registers while the coder works.
+    struct Slots
+    {
+        Inputs inputs;             // the stretched estimates the mixers blend
+        std::int32_t* weights_run; // each mixer's selected weight vector
+        std::int32_t* weights_class;
+        std::uint32_t* history_cell; // the order-1 history's counter
+        std::uint16_t* pair1;        // the cells each refinement interpolates
+        std::uint16_t* pair2;
+        std::size_t slot; // the node's cell within each context
+        int mixed_run;    // each mixer's own 12-bit estimate, for its update
+        int mixed_class;
+        int probability; // the final 16-bit estimate
+    };
+
+    explicit MixedModel(const std::size_t block_size)
+        : order0_(1U, fixed_initial), order1_(256U), order1_slow_(256U, adaptive_initial),
+          order2_(std::size_t{1} << (order2_bits(block_size) - 8U), adaptive_initial),
+          sparse_(256U, fixed_initial), runs_(run_buckets * 256U, adaptive_initial),
+          order2_shift_(32U - (order2_bits(block_size) - 8U)),
+          by_run_(run_classes * 256U, initial_weights()), by_class_(4U * 256U, initial_weights()),
+          apm_order1_(256U * 256U), apm_run_(run_buckets * 256U)
+    {
+    }
+
+    MixedModel(const MixedModel&) = delete;
+    MixedModel& operator=(const MixedModel&) = delete;
+
+    // Call once per byte before its first bit: fixes the rows every bit of the byte reads.
+    void begin_byte() noexcept
+    {
+        const unsigned int run_bucket = run_bucket_of(run_);
+        row1_ = order1_.context(c1_);
+        row1_slow_ = order1_slow_.context(c1_);
+        row2_ = order2_.context(order2_row(d1_, c1_));
+        row_sparse_ = sparse_.context(c2_);
+        row_run_ = runs_.context((run_bucket << 8U) | c1_);
+        weights_run_ = by_run_.weights(run_class_of(run_) << 8U);
+        weights_class_ = by_class_.weights((c1_ >> 6U) << 8U);
+        apm_order1_row_ = apm_order1_.context(c1_ << 8U);
+        apm_run_row_ = apm_run_.context(run_bucket << 8U);
+    }
+
+    // For an encoder, which knows what follows: warms the lines that `next`, the byte after
+    // `current`, will need, a whole byte ahead of their use. The model itself is untouched.
+    MZIP_CM_INLINE void prefetch_next(const unsigned int current, const unsigned int next) noexcept
+    {
+        const bool continues = current == c1_;
+        const unsigned int run = continues ? run_ + 1U : 1U;
+        const std::size_t high_block = static_cast<std::size_t>((next >> 4U) + 1U) << 4U;
+        prefetch_row(order1_.context(current), high_block);
+        prefetch_row(order1_slow_.context(current), high_block);
+        prefetch_row(order2_.context(order2_row(continues ? d1_ : c1_, current)), high_block);
+        prefetch_row(sparse_.context(c1_), high_block);
+        prefetch_row(runs_.context((run_bucket_of(run) << 8U) | current), high_block);
+        unsigned int node = 1;
+        for (unsigned int shift = 8U; shift-- > 0U;)
+        {
+            prefetch_refinement(apm_order1_.context((current << 8U) | node));
+            node = node * 2U + ((next >> shift) & 1U);
+        }
+    }
+
+    // Estimates the next bit given the partial byte `node` (1..255).
+    [[nodiscard]] MZIP_CM_INLINE Slots predict(const unsigned int node) noexcept
+    {
+        prefetch_ahead(node);
+        return step<false>(node, 0U);
+    }
+
+    MZIP_CM_INLINE void update(const Slots& slots, const unsigned int bit) noexcept
+    {
+        counter_update(row0_[slots.slot], bit, order0_shift);
+        counter_update(*slots.history_cell, bit, history_limit);
+        row1_[slots.slot] = history_push(row1_[slots.slot], bit);
+        counter_update(row1_slow_[slots.slot], bit, slow_limit);
+        counter_update(row2_[slots.slot], bit, order2_limit);
+        counter_update(row_sparse_[slots.slot], bit, sparse_shift);
+        counter_update(row_run_[slots.slot], bit, run_limit);
+        learn(slots, bit);
+    }
+
+    // Both steps at once for an encoder, which knows the bit before coding it: each counter
+    // is then read and updated in one go. Returns the 16-bit probability of a one.
+    [[nodiscard]] MZIP_CM_INLINE int predict_and_update(const unsigned int node,
+                                                        const unsigned int bit) noexcept
+    {
+        const Slots slots = step<true>(node, bit);
+        learn(slots, bit);
+        return slots.probability;
+    }
+
+    void end_byte(const unsigned int byte) noexcept
+    {
+        if (byte == c1_)
+        {
+            ++run_;
+        }
+        else
+        {
+            run_ = 1U;
+            d1_ = c1_;
+        }
+        c2_ = c1_;
+        c1_ = byte;
+    }
+
+private:
+    // The slow order-1 estimate starts weightless and only matters once the mixer learns it.
+    [[nodiscard]] static Inputs initial_weights() noexcept
+    {
+        Inputs weights{};
+        weights.fill(mixer_initial_weight);
+        weights[5] = 0;
+        return weights;
+    }
+
+    [[nodiscard]] std::size_t order2_row(const unsigned int d1,
+                                         const unsigned int c1) const noexcept
+    {
+        const std::uint32_t pair = (d1 << 8U) | c1;
+        return static_cast<std::size_t>((pair * 0x9E3779B1U) >> order2_shift_);
+    }
+
+    // Warms a context's first-nibble block and the second-nibble block `high_block` starts.
+    template <typename Cell>
+    static MZIP_CM_INLINE void prefetch_row(const Cell* row, const std::size_t high_block) noexcept
+    {
+        prefetch(row);
+        prefetch(row + high_block);
+    }
+
+    // Warms one refinement context (66 bytes, so up to two lines) and the one after it.
+    static MZIP_CM_INLINE void prefetch_refinement(const std::uint16_t* cells) noexcept
+    {
+        prefetch(cells);
+        prefetch(cells + 32);
+        prefetch(cells + 64);
+    }
+
+    // For a decoder, which cannot look a byte ahead: warms what the coming bits may touch, as
+    // far as the bits decoded so far narrow it down. The next bit's two candidate refinement
+    // contexts are adjacent (on the last bit this lands on a neighbouring context instead,
+    // harmlessly and within the table); after three bits, the second nibble's block in the two
+    // largest tables is one of four; and on the last bit, the next byte is one of two, so its
+    // rows in those tables and its first refinement context can be warmed too.
+    MZIP_CM_INLINE void prefetch_ahead(const unsigned int node) noexcept
+    {
+        prefetch_refinement(apm_order1_.context((c1_ << 8U) | (node * 2U)));
+        if (node >= 4U && node < 8U)
+        {
+            const std::size_t block = static_cast<std::size_t>((node & 3U) * 4U + 1U) << 4U;
+            for (std::size_t candidate = 0; candidate < 4U; ++candidate)
+            {
+                prefetch(row2_ + block + candidate * 16U);
+                prefetch(row_run_ + block + candidate * 16U);
+            }
+        }
+        else if (node >= 128U)
+        {
+            const unsigned int first = (node * 2U) & 255U;
+            for (unsigned int next = first; next < first + 2U; ++next)
+            {
+                const bool continues = next == c1_;
+                prefetch(order2_.context(order2_row(continues ? d1_ : c1_, next)));
+                prefetch(runs_.context((run_bucket_of(continues ? run_ + 1U : 1U) << 8U) | next));
+                prefetch(apm_order1_.context((next << 8U) | 1U));
+            }
+        }
+    }
+
+    template <bool Update>
+    [[nodiscard]] MZIP_CM_INLINE Slots step(const unsigned int node,
+                                            const unsigned int bit) noexcept
+    {
+        Slots slots{};
+        slots.slot = node_slots[node];
+        std::uint8_t& history = row1_[slots.slot];
+        slots.history_cell = order1_.cell(history);
+        slots.inputs[0] = sample<Update>(row0_[slots.slot], bit, order0_shift);
+        slots.inputs[1] = sample<Update>(*slots.history_cell, bit, history_limit);
+        slots.inputs[2] = sample<Update>(row2_[slots.slot], bit, order2_limit);
+        slots.inputs[3] = sample<Update>(row_sparse_[slots.slot], bit, sparse_shift);
+        slots.inputs[4] = sample<Update>(row_run_[slots.slot], bit, run_limit);
+        slots.inputs[5] = sample<Update>(row1_slow_[slots.slot], bit, slow_limit);
+        if constexpr (Update)
+        {
+            history = history_push(history, bit);
+        }
+
+        slots.weights_run = weights_run_ + node * mixer_inputs;
+        int domain = Mixer<mixer_inputs>::mix(slots.weights_run, slots.inputs);
+        slots.mixed_run = squash_in_domain(domain);
+        slots.weights_class = weights_class_ + node * mixer_inputs;
+        const int by_class = Mixer<mixer_inputs>::mix(slots.weights_class, slots.inputs);
+        slots.mixed_class = squash_in_domain(by_class);
+        domain = (domain + by_class + 1) >> 1U;
+        const int mixed = squash_in_domain(domain);
+
+        const int position = domain + 2048;
+        const int fraction = position & 127;
+        slots.pair1 = Apm::pair(apm_order1_row_ + node * Apm::cells_per_context, position);
+        slots.pair2 = Apm::pair(apm_run_row_ + node * Apm::cells_per_context, position);
+        const int refined1 = Apm::refine(slots.pair1, fraction);
+        const int refined2 = Apm::refine(slots.pair2, fraction);
+        const int probability = ((mixed << 4U) + refined1 + 2 * refined2 + 2) >> 2U;
+        slots.probability = std::clamp(probability, 1, 65535);
+        return slots;
+    }
+
+    // A counter's stretched probability, updating the counter on the way when the bit is known.
+    template <bool Update, typename Cell>
+    [[nodiscard]] static MZIP_CM_INLINE int
+    sample(Cell& cell, [[maybe_unused]] const unsigned int bit,
+           [[maybe_unused]] const unsigned int rate) noexcept
+    {
+        const int input = stretch(counter_probability(cell));
+        if constexpr (Update)
+        {
+            counter_update(cell, bit, rate);
+        }
+        return input;
+    }
+
+    // The mixers and both refinement stages learn from the coded bit.
+    static MZIP_CM_INLINE void learn(const Slots& slots, const unsigned int bit) noexcept
+    {
+        Mixer<mixer_inputs>::update(slots.weights_run, slots.inputs, slots.mixed_run, bit,
+                                    mixer_rate);
+        Mixer<mixer_inputs>::update(slots.weights_class, slots.inputs, slots.mixed_class, bit,
+                                    mixer_rate);
+        const int target = Apm::target(bit);
+        Apm::update(slots.pair1, target);
+        Apm::update(slots.pair2, target);
+    }
+
+    NibbleTable<std::uint16_t> order0_;
+    HistoryModel order1_;
+    NibbleTable<std::uint32_t> order1_slow_;
+    NibbleTable<std::uint32_t> order2_;
+    NibbleTable<std::uint16_t> sparse_;
+    NibbleTable<std::uint32_t> runs_;
+    unsigned int order2_shift_;
+    Mixer<mixer_inputs> by_run_;
+    Mixer<mixer_inputs> by_class_;
+    Apm apm_order1_;
+    Apm apm_run_;
+
+    std::uint16_t* row0_ = order0_.context(0);
+    std::uint8_t* row1_ = nullptr;
+    std::uint32_t* row1_slow_ = nullptr;
+    std::uint32_t* row2_ = nullptr;
+    std::uint16_t* row_sparse_ = nullptr;
+    std::uint32_t* row_run_ = nullptr;
+    std::int32_t* weights_run_ = nullptr;
+    std::int32_t* weights_class_ = nullptr;
+    std::uint16_t* apm_order1_row_ = nullptr;
+    std::uint16_t* apm_run_row_ = nullptr;
+    unsigned int c1_ = 0;
+    unsigned int c2_ = 0;
+    unsigned int d1_ = 0;
+    unsigned int run_ = 0;
+};
+
+// ---- Version 2 model, kept so that existing archives stay readable --------------------------
+
 constexpr std::uint16_t cm_half = 1U << 15U;
 constexpr unsigned int cm_apm_columns = 17;
 
@@ -819,7 +1524,7 @@ void cm_toward_zero(std::uint16_t& probability, const unsigned int shift)
 }
 
 // Order-0 and two order-1 counters mixed 7:7:2, then an adaptive map per tree node.
-struct CmModel
+struct LegacyCmModel
 {
     std::vector<std::uint16_t> order0;
     std::vector<std::uint16_t> order1;
@@ -828,7 +1533,8 @@ struct CmModel
     unsigned int before_previous = 0;
     unsigned int run = 0;
 
-    CmModel() : order0(256U, cm_half), order1(256U * 256U, cm_half), apm(512U * cm_apm_columns)
+    LegacyCmModel()
+        : order0(256U, cm_half), order1(256U * 256U, cm_half), apm(512U * cm_apm_columns)
     {
         for (unsigned int row = 0; row < 512U; ++row)
         {
@@ -931,21 +1637,27 @@ std::optional<Bytes> cm_encode(const std::span<const Byte> input, const std::siz
 {
     Bytes output;
     output.reserve(std::min(size_limit, input.size() / 2U + 64U));
-    const auto model = std::make_unique<CmModel>();
+    MixedModel model(input.size());
     std::uint32_t low = 0;
     std::uint32_t high = 0xFFFFFFFFU;
 
-    for (const Byte value : input)
+    for (std::size_t index = 0; index < input.size(); ++index)
     {
-        const unsigned int flag = model->run_flag();
+        const Byte value = input[index];
+        model.begin_byte();
+        if (index + 1U < input.size())
+        {
+            model.prefetch_next(value, input[index + 1U]);
+        }
         unsigned int node = 1;
         for (unsigned int shift = 8U; shift-- > 0U;)
         {
             const unsigned int bit = (value >> shift) & 1U;
-            const CmModel::Slots slots = model->predict(node, flag);
+            const auto probability =
+                static_cast<std::uint32_t>(model.predict_and_update(node, bit));
             const std::uint32_t mid =
                 low + static_cast<std::uint32_t>(
-                          (static_cast<std::uint64_t>(high - low) * slots.scaled) >> 18U);
+                          (static_cast<std::uint64_t>(high - low) * probability) >> 16U);
             if (bit != 0U)
             {
                 high = mid;
@@ -960,10 +1672,9 @@ std::optional<Bytes> cm_encode(const std::span<const Byte> input, const std::siz
                 low <<= 8U;
                 high = (high << 8U) | 0xFFU;
             }
-            model->update(slots, bit);
             node = node * 2U + bit;
         }
-        model->advance(node & 255U);
+        model.end_byte(node & 255U);
         if (output.size() > size_limit)
         {
             return std::nullopt;
@@ -985,7 +1696,71 @@ Bytes cm_decode(const std::span<const Byte> payload, const std::size_t expected_
 {
     Bytes output;
     output.reserve(expected_size);
-    const auto model = std::make_unique<CmModel>();
+    MixedModel model(expected_size);
+    std::uint32_t low = 0;
+    std::uint32_t high = 0xFFFFFFFFU;
+    std::uint32_t code = 0;
+    std::size_t position = 0;
+    const auto next_byte = [&]() -> std::uint32_t
+    {
+        if (position >= payload.size())
+        {
+            throw FormatError("truncated mixed payload");
+        }
+        return payload[position++];
+    };
+
+    for (int iteration = 0; iteration < 4; ++iteration)
+    {
+        code = (code << 8U) | next_byte();
+    }
+    for (std::size_t index = 0; index < expected_size; ++index)
+    {
+        model.begin_byte();
+        unsigned int node = 1;
+        for (unsigned int shift = 8U; shift-- > 0U;)
+        {
+            const MixedModel::Slots slots = model.predict(node);
+            const auto probability = static_cast<std::uint32_t>(slots.probability);
+            const std::uint32_t mid =
+                low + static_cast<std::uint32_t>(
+                          (static_cast<std::uint64_t>(high - low) * probability) >> 16U);
+            // The bit is only known after the comparison, so a real branch lets the processor
+            // run ahead on its prediction instead of waiting for the whole chain.
+            const unsigned int bit = code <= mid ? 1U : 0U;
+            if (bit != 0U)
+            {
+                high = mid;
+            }
+            else
+            {
+                low = mid + 1U;
+            }
+            while (((low ^ high) & 0xFF000000U) == 0U)
+            {
+                low <<= 8U;
+                high = (high << 8U) | 0xFFU;
+                code = (code << 8U) | next_byte();
+            }
+            model.update(slots, bit);
+            node = node * 2U + bit;
+        }
+        const unsigned int byte = node & 255U;
+        model.end_byte(byte);
+        output.push_back(static_cast<Byte>(byte));
+    }
+    if (position != payload.size())
+    {
+        throw FormatError("mixed payload contains trailing bytes");
+    }
+    return output;
+}
+
+Bytes cm_decode_v2(const std::span<const Byte> payload, const std::size_t expected_size)
+{
+    Bytes output;
+    output.reserve(expected_size);
+    const auto model = std::make_unique<LegacyCmModel>();
     std::uint32_t low = 0;
     std::uint32_t high = 0xFFFFFFFFU;
     std::uint32_t code = 0;
@@ -1009,7 +1784,7 @@ Bytes cm_decode(const std::span<const Byte> payload, const std::size_t expected_
         unsigned int node = 1;
         for (unsigned int shift = 8U; shift-- > 0U;)
         {
-            const CmModel::Slots slots = model->predict(node, flag);
+            const LegacyCmModel::Slots slots = model->predict(node, flag);
             const std::uint32_t mid =
                 low + static_cast<std::uint32_t>(
                           (static_cast<std::uint64_t>(high - low) * slots.scaled) >> 18U);
@@ -1206,6 +1981,100 @@ Bytes lzp_decode(const std::span<const Byte> input, const std::size_t expected_s
         throw FormatError("LZP stream contains trailing bytes");
     }
     return output;
+}
+
+// ---- x86 branch-target filter ---------------------------------------------------------------
+
+namespace
+{
+
+// Opcode byte plus a little-endian rel32 operand.
+constexpr std::size_t x86_branch_size = 5;
+
+[[nodiscard]] bool x86_branch_opcode(const Byte value) noexcept
+{
+    return value == 0xE8U || value == 0xE9U;
+}
+
+// Converted operands are 25-bit signed values: the top byte is 0x00 or 0xFF before the
+// transform, and the stored form sign-extends bit 24 so the same test holds afterwards.
+[[nodiscard]] bool x86_operand_fits(const Byte top) noexcept
+{
+    return top == 0x00U || top == 0xFFU;
+}
+
+[[nodiscard]] std::uint32_t x86_read_operand(const std::span<const Byte> data,
+                                             const std::size_t at) noexcept
+{
+    return std::uint32_t{data[at]} | (std::uint32_t{data[at + 1U]} << 8U) |
+           (std::uint32_t{data[at + 2U]} << 16U) | (std::uint32_t{data[at + 3U]} << 24U);
+}
+
+void x86_write_operand(const std::span<Byte> data, const std::size_t at,
+                       const std::uint32_t value) noexcept
+{
+    data[at] = static_cast<Byte>(value & 0xFFU);
+    data[at + 1U] = static_cast<Byte>((value >> 8U) & 0xFFU);
+    data[at + 2U] = static_cast<Byte>((value >> 16U) & 0xFFU);
+    data[at + 3U] = (value & 0x0100'0000U) != 0U ? Byte{0xFFU} : Byte{0x00U};
+}
+
+enum class X86Pass
+{
+    count,
+    encode,
+    decode
+};
+
+// Every pass walks the same positions: opcode bytes are never rewritten and the operand
+// bytes after an opcode are skipped whether or not they were converted. Returns how many
+// converted operands name a target inside the block.
+template <X86Pass Pass, typename Span> std::size_t x86_filter(const Span data) noexcept
+{
+    std::size_t targets = 0;
+    std::size_t index = 0;
+    while (index + x86_branch_size <= data.size())
+    {
+        if (!x86_branch_opcode(data[index]))
+        {
+            ++index;
+            continue;
+        }
+        const std::size_t operand = index + 1U;
+        if (x86_operand_fits(data[operand + 3U]))
+        {
+            const auto next = static_cast<std::uint32_t>(index + x86_branch_size);
+            const std::uint32_t value = x86_read_operand(data, operand);
+            const std::uint32_t converted = Pass == X86Pass::decode ? value - next : value + next;
+            if constexpr (Pass != X86Pass::count)
+            {
+                x86_write_operand(data, operand, converted);
+            }
+            if (converted < data.size())
+            {
+                ++targets;
+            }
+        }
+        index += x86_branch_size;
+    }
+    return targets;
+}
+
+} // namespace
+
+std::size_t x86_branch_targets(const std::span<const Byte> data) noexcept
+{
+    return x86_filter<X86Pass::count>(data);
+}
+
+std::size_t x86_filter_encode(const std::span<Byte> data) noexcept
+{
+    return x86_filter<X86Pass::encode>(data);
+}
+
+void x86_filter_decode(const std::span<Byte> data) noexcept
+{
+    static_cast<void>(x86_filter<X86Pass::decode>(data));
 }
 
 std::uint32_t adler32(const std::span<const Byte> input) noexcept

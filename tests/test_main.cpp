@@ -344,6 +344,188 @@ void test_cm_and_lzp_round_trip()
     CHECK(!mzip::detail::lzp_encode(random_bytes(4'096U, 22U)).has_value());
 }
 
+// A pseudo program: random filler with E8/E9 branches to a few targets inside the block and
+// some to addresses before it.
+[[nodiscard]] Bytes synthetic_x86(const std::size_t size, const std::uint32_t seed)
+{
+    std::mt19937 generator(seed);
+    std::uniform_int_distribution<unsigned int> byte_distribution(0U, 255U);
+    std::uniform_int_distribution<std::size_t> gap_distribution(3U, 14U);
+    std::uniform_int_distribution<unsigned int> target_distribution(0U, 7U);
+    std::uniform_int_distribution<unsigned int> kind_distribution(0U, 15U);
+    Bytes program(size);
+    for (Byte& value : program)
+    {
+        value = static_cast<Byte>(byte_distribution(generator));
+    }
+    std::size_t index = gap_distribution(generator);
+    while (index + 5U <= size)
+    {
+        const unsigned int kind = kind_distribution(generator);
+        program[index] = kind == 0U ? Byte{0xE9U} : Byte{0xE8U};
+        const auto next = static_cast<std::uint32_t>(index + 5U);
+        const std::uint32_t target = kind == 1U ? 0U - 0x100U - target_distribution(generator) * 64U
+                                                : 0x40U + target_distribution(generator) * 0x3B0U;
+        const std::uint32_t operand = target - next;
+        for (unsigned int byte = 0; byte < 4U; ++byte)
+        {
+            program[index + 1U + byte] = static_cast<Byte>((operand >> (byte * 8U)) & 0xFFU);
+        }
+        index += 5U + gap_distribution(generator);
+    }
+    return program;
+}
+
+void test_x86_filter_round_trip()
+{
+    // Operand + 5 at offset 0; the skip over operand bytes; a negative operand; a top byte
+    // outside 0x00/0xFF left alone; a trailing opcode without room for its operand.
+    const Bytes program{0xE8U, 0x10U, 0x00U, 0x00U, 0x00U, 0xE8U, 0xE8U, 0xE8U, 0xE8U,
+                        0x00U, 0x90U, 0xE9U, 0xFDU, 0xFFU, 0xFFU, 0xFFU, 0xE8U, 0x01U,
+                        0x02U, 0x03U, 0x12U, 0x90U, 0xE8U, 0x00U, 0x00U};
+    const Bytes expected{0xE8U, 0x15U, 0x00U, 0x00U, 0x00U, 0xE8U, 0xF2U, 0xE8U, 0xE8U,
+                         0x00U, 0x90U, 0xE9U, 0x0DU, 0x00U, 0x00U, 0x00U, 0xE8U, 0x01U,
+                         0x02U, 0x03U, 0x12U, 0x90U, 0xE8U, 0x00U, 0x00U};
+    Bytes filtered = program;
+    CHECK_EQ(mzip::detail::x86_filter_encode(filtered), std::size_t{2});
+    CHECK_EQ(filtered, expected);
+    mzip::detail::x86_filter_decode(filtered);
+    CHECK_EQ(filtered, program);
+
+    // Both 25-bit extremes survive the sign-extended top byte.
+    for (const std::uint32_t operand : {0x00FFFFFFU, 0xFF000000U, 0x00000000U, 0xFFFFFFFFU})
+    {
+        Bytes edge{0xE8U, 0U, 0U, 0U, 0U, 0U};
+        for (unsigned int byte = 0; byte < 4U; ++byte)
+        {
+            edge[1U + byte] = static_cast<Byte>((operand >> (byte * 8U)) & 0xFFU);
+        }
+        Bytes coded = edge;
+        static_cast<void>(mzip::detail::x86_filter_encode(coded));
+        CHECK(coded != edge);
+        mzip::detail::x86_filter_decode(coded);
+        CHECK_EQ(coded, edge);
+    }
+
+    // Dense random streams exercise opcodes inside operands and every boundary.
+    std::mt19937 generator(20260801U);
+    std::uniform_int_distribution<std::size_t> size_distribution(0U, 3'000U);
+    std::uniform_int_distribution<unsigned int> byte_distribution(0U, 255U);
+    for (unsigned int round = 0; round < 300U; ++round)
+    {
+        Bytes input(size_distribution(generator));
+        for (Byte& value : input)
+        {
+            const unsigned int pick = byte_distribution(generator);
+            value = pick < 48U    ? Byte{0xE8U}
+                    : pick < 64U  ? Byte{0xE9U}
+                    : pick < 128U ? Byte{0x00U}
+                    : pick < 160U ? Byte{0xFFU}
+                                  : static_cast<Byte>(pick);
+        }
+        Bytes coded = input;
+        static_cast<void>(mzip::detail::x86_filter_encode(coded));
+        mzip::detail::x86_filter_decode(coded);
+        CHECK_EQ(coded, input);
+    }
+
+    const Bytes synthetic = synthetic_x86(96'000U, 5U);
+    Bytes synthetic_coded = synthetic;
+    CHECK(mzip::detail::x86_filter_encode(synthetic_coded) > 4'000U);
+    CHECK(synthetic_coded != synthetic);
+    mzip::detail::x86_filter_decode(synthetic_coded);
+    CHECK_EQ(synthetic_coded, synthetic);
+
+    // A slice of a real executable, when the host has one.
+    for (const char* candidate : {"/usr/bin/ls", "/bin/ls", "/usr/bin/env", "/bin/sh"})
+    {
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(candidate, error))
+        {
+            continue;
+        }
+        Bytes binary = read_file(candidate);
+        binary.resize(std::min<std::size_t>(binary.size(), 512U * 1024U));
+        Bytes binary_coded = binary;
+        static_cast<void>(mzip::detail::x86_filter_encode(binary_coded));
+        mzip::detail::x86_filter_decode(binary_coded);
+        CHECK_EQ(binary_coded, binary);
+
+        TemporaryDirectory directory;
+        const auto source = directory.file("binary.bin");
+        const auto archive = directory.file("binary.mz");
+        const auto restored = directory.file("binary.out");
+        write_file(source, binary);
+        static_cast<void>(mzip::compress_file(source, archive));
+        static_cast<void>(mzip::decompress_file(archive, restored));
+        CHECK_EQ(read_file(restored), binary);
+        break;
+    }
+}
+
+void test_x86_flag_in_archives()
+{
+    TemporaryDirectory directory;
+    const auto source = directory.file("program.bin");
+    const auto archive = directory.file("program.mz");
+    const auto restored = directory.file("program.out");
+    const Bytes program = synthetic_x86(200'000U, 9U);
+    write_file(source, program);
+    const auto stats = mzip::compress_file(source, archive);
+    CHECK_EQ(stats.block_count, 1U);
+    Bytes bytes = read_file(archive);
+    // The block header follows the 24-byte file header; the filter flag is bit 1 of its flags.
+    CHECK(bytes.size() > 48U);
+    CHECK_EQ(bytes[4], Byte{3U});
+    CHECK_EQ(bytes[25] & 0x02U, 0x02U);
+    static_cast<void>(mzip::decompress_file(archive, restored));
+    CHECK_EQ(read_file(restored), program);
+
+    // Machine code followed by repeated data takes both the x86 filter and an LZP pass; the
+    // decoder has to undo them in the right order.
+    Bytes mixed = synthetic_x86(60'000U, 21U);
+    Bytes chunk = random_bytes(3'000U, 22U);
+    for (Byte& value : chunk)
+    {
+        if (value == 0xE8U || value == 0xE9U)
+        {
+            value = 0x90U;
+        }
+    }
+    for (unsigned int copy = 0; copy < 30U; ++copy)
+    {
+        mixed.insert(mixed.end(), chunk.begin(), chunk.end());
+    }
+    const auto mixed_source = directory.file("mixed.bin");
+    const auto mixed_archive = directory.file("mixed.mz");
+    write_file(mixed_source, mixed);
+    static_cast<void>(mzip::compress_file(mixed_source, mixed_archive));
+    const Bytes mixed_bytes = read_file(mixed_archive);
+    CHECK(mixed_bytes.size() > 48U);
+    CHECK_EQ(mixed_bytes[25], Byte{0x03U});
+    static_cast<void>(mzip::decompress_file(mixed_archive, restored));
+    CHECK_EQ(read_file(restored), mixed);
+
+    // Version 2 archives may not carry the flag.
+    Bytes downgraded = bytes;
+    downgraded[4] = 2U;
+    write_file(archive, downgraded);
+    expect_format_error([&] { static_cast<void>(mzip::decompress_file(archive, restored)); });
+
+    // Raw blocks may not carry it either.
+    const auto random_source = directory.file("random.bin");
+    const auto random_archive = directory.file("random.mz");
+    write_file(random_source, random_bytes(8'192U, 31U));
+    const auto random_stats = mzip::compress_file(random_source, random_archive);
+    CHECK_EQ(random_stats.raw_blocks, 1U);
+    Bytes raw = read_file(random_archive);
+    CHECK_EQ(raw[25], Byte{0U});
+    raw[25] = 0x02U;
+    write_file(random_archive, raw);
+    expect_format_error([&]
+                        { static_cast<void>(mzip::decompress_file(random_archive, restored)); });
+}
+
 void test_stream_lzp_round_trip()
 {
     const Bytes chunk = random_bytes(3'000U, 33U);
@@ -658,6 +840,36 @@ void test_golden_archive()
     }
     input.resize(2600U);
 
+    static const unsigned char golden_v3[] = {
+        0x4DU, 0x5AU, 0x49U, 0x50U, 0x03U, 0x02U, 0x00U, 0x00U, 0x00U, 0x04U, 0x00U, 0x00U, 0x28U,
+        0x0AU, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x01U, 0x00U, 0x00U, 0x00U, 0x7EU, 0x01U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0xE4U, 0x90U, 0xB6U, 0x1EU, 0x14U, 0x00U, 0x00U,
+        0x00U, 0x02U, 0x00U, 0x00U, 0x00U, 0x7EU, 0x01U, 0x00U, 0x00U, 0x27U, 0x01U, 0x00U, 0x00U,
+        0x79U, 0x01U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x12U, 0xADU, 0xA1U, 0x37U, 0xFBU,
+        0xFBU, 0x53U, 0x95U, 0xFFU, 0xFDU, 0x67U, 0x11U, 0x0AU, 0xCCU, 0x0AU, 0xAAU, 0xF6U, 0x1BU,
+        0xAAU, 0x8DU, 0x42U, 0x25U, 0x33U, 0xA5U, 0xE1U, 0x22U, 0x40U, 0x40U, 0x32U, 0xC9U, 0xF7U,
+        0xBFU, 0xC1U, 0x6FU, 0x65U, 0x20U, 0x80U, 0x20U, 0x1BU, 0x1DU, 0x3DU, 0x99U, 0x16U, 0xB3U,
+        0x66U, 0x85U, 0x61U, 0x62U, 0xC0U, 0x6AU, 0x5BU, 0x73U, 0xC1U, 0xC4U, 0xC0U, 0x0FU, 0xE0U,
+        0x84U, 0x14U, 0xA4U, 0x49U, 0x60U, 0x6FU, 0xF3U, 0xEBU, 0x89U, 0x9EU, 0x28U, 0x57U, 0x11U,
+        0xB1U, 0xE4U, 0xB4U, 0xA3U, 0x57U, 0x5EU, 0x4DU, 0xA9U, 0xD7U, 0x60U, 0x4DU, 0x47U, 0x3DU,
+        0x1FU, 0x76U, 0x26U, 0x65U, 0xE9U, 0x31U, 0x2BU, 0xD4U, 0x99U, 0xDBU, 0x70U, 0x41U, 0xCFU,
+        0x32U, 0xC8U, 0x44U, 0xF2U, 0xDCU, 0x55U, 0xCBU, 0x78U, 0x87U, 0x9AU, 0x6DU, 0x70U, 0xCDU,
+        0x44U, 0x69U, 0x61U, 0x3CU, 0x74U, 0xA3U, 0x68U, 0x05U, 0xD4U, 0x5DU, 0x22U, 0xBCU, 0xB3U,
+        0x60U, 0xC4U, 0xBBU, 0x8BU, 0x3CU, 0x80U, 0x03U, 0xCFU, 0x19U, 0xF6U, 0xDDU, 0x60U, 0x66U,
+        0xA3U, 0xA9U, 0x73U, 0xBDU, 0x06U, 0x12U, 0xB4U, 0x26U, 0xC1U, 0x4AU, 0x2FU, 0xEAU, 0xA6U,
+        0x00U, 0x5FU, 0xB4U, 0x79U, 0xDFU, 0x7CU, 0xA0U, 0xE4U, 0x1BU, 0xD4U, 0xD2U, 0x70U, 0x40U,
+        0xA6U, 0x9FU, 0x42U, 0x90U, 0x45U, 0x57U, 0xA2U, 0x01U, 0x83U, 0x89U, 0x32U, 0x06U, 0x52U,
+        0x41U, 0xFEU, 0x88U, 0xECU, 0xB0U, 0x14U, 0x32U, 0xADU, 0xB1U, 0x3AU, 0x89U, 0xBEU, 0xB1U,
+        0x63U, 0x63U, 0xFEU, 0x07U, 0x3CU, 0x74U, 0x8FU, 0x87U, 0x61U, 0xADU, 0xABU, 0xB9U, 0x40U,
+        0x27U, 0x1DU, 0x83U, 0xE6U, 0x9FU, 0x26U, 0x6DU, 0xE7U, 0x18U, 0x26U, 0xBEU, 0xB4U, 0xCAU,
+        0xFEU, 0x62U, 0x72U, 0x98U, 0x28U, 0xBFU, 0xA1U, 0x9CU, 0x61U, 0x23U, 0xEEU, 0xCFU, 0xB1U,
+        0xC5U, 0xA2U, 0x4DU, 0x5BU, 0x1EU, 0x29U, 0x01U, 0x31U, 0xF1U, 0x2EU, 0x4DU, 0x70U, 0x1AU,
+        0x07U, 0x34U, 0xCCU, 0x71U, 0x97U, 0x26U, 0xCCU, 0x47U, 0xE9U, 0x86U, 0x4BU, 0xA5U, 0xB2U,
+        0xEBU, 0x59U, 0x97U, 0xB7U, 0x5CU, 0x3EU, 0x65U, 0x28U, 0x46U, 0x2EU, 0x8BU, 0x0AU, 0x1FU,
+        0x12U, 0x06U, 0x32U, 0x85U, 0x18U, 0x96U, 0xE7U, 0x1AU, 0x08U, 0x63U, 0x26U, 0x5DU, 0x5BU,
+        0xC4U, 0x8DU, 0x0BU, 0x29U, 0x5FU, 0x32U, 0x04U, 0x27U, 0x61U, 0xD1U, 0xDFU, 0x39U, 0x97U,
+        0x5CU, 0x27U, 0x1DU, 0x46U, 0x3AU, 0x8CU, 0x79U, 0x6AU};
+
     static const unsigned char golden_v2[] = {
         0x4DU, 0x5AU, 0x49U, 0x50U, 0x02U, 0x02U, 0x00U, 0x00U, 0x00U, 0x04U, 0x00U, 0x00U, 0x28U,
         0x0AU, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x01U, 0x00U, 0x00U, 0x00U, 0x7EU, 0x01U,
@@ -734,8 +946,7 @@ void test_golden_archive()
         0xEBU, 0x77U, 0x88U, 0x6CU, 0xE2U, 0x40U, 0x2BU, 0x2DU, 0xE1U, 0x7FU, 0x30U, 0x44U, 0xD3U,
         0x7AU, 0xFAU, 0xB8U, 0xD0U, 0x79U, 0x83U, 0x92U, 0xE7U, 0xEDU, 0xF0U, 0x46U, 0x44U, 0x16U,
         0x80U, 0xD9U, 0xF2U, 0x90U, 0x34U, 0x98U};
-    const Bytes expected(golden_v2, golden_v2 + sizeof(golden_v2));
-    const Bytes legacy(golden_v1, golden_v1 + sizeof(golden_v1));
+    const Bytes expected(golden_v3, golden_v3 + sizeof(golden_v3));
 
     TemporaryDirectory directory;
     const auto source = directory.file("golden.bin");
@@ -753,12 +964,19 @@ void test_golden_archive()
     static_cast<void>(mzip::decompress_file(pinned, restored));
     CHECK_EQ(read_file(restored), input);
 
-    // Version 1 archives stay readable.
-    const auto pinned_v1 = directory.file("pinned-v1.mz");
-    write_file(pinned_v1, legacy);
-    const auto restored_v1 = directory.file("restored-v1.bin");
-    static_cast<void>(mzip::decompress_file(pinned_v1, restored_v1));
-    CHECK_EQ(read_file(restored_v1), input);
+    // Version 1 and 2 archives stay readable.
+    const Bytes legacy_v1(golden_v1, golden_v1 + sizeof(golden_v1));
+    const Bytes legacy_v2(golden_v2, golden_v2 + sizeof(golden_v2));
+    unsigned int legacy_index = 1;
+    for (const Bytes* legacy : {&legacy_v1, &legacy_v2})
+    {
+        const std::string suffix = std::to_string(legacy_index++);
+        const auto pinned_legacy = directory.file("pinned-v" + suffix + ".mz");
+        write_file(pinned_legacy, *legacy);
+        const auto restored_legacy = directory.file("restored-v" + suffix + ".bin");
+        static_cast<void>(mzip::decompress_file(pinned_legacy, restored_legacy));
+        CHECK_EQ(read_file(restored_legacy), input);
+    }
 }
 
 void test_directory_output_is_rejected()
@@ -1080,6 +1298,8 @@ int main()
     run_test("stream codec round-trip", test_stream_codec_round_trip);
     run_test("context mixer and LZP round-trip", test_cm_and_lzp_round_trip);
     run_test("stream LZP round-trip", test_stream_lzp_round_trip);
+    run_test("x86 filter round-trip", test_x86_filter_round_trip);
+    run_test("x86 flag in archives", test_x86_flag_in_archives);
     run_test("file round-trip and determinism", test_file_round_trip_and_determinism);
     run_test("block mode selection", test_block_mode_selection);
     run_test("corrupt archive handling", test_corrupt_archives_do_not_replace_output);

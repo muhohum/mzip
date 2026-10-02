@@ -30,7 +30,7 @@ using detail::Byte;
 using detail::Bytes;
 
 constexpr std::array<char, 4> archive_magic{'M', 'Z', 'I', 'P'};
-constexpr std::uint8_t archive_version = 2U;
+constexpr std::uint8_t archive_version = 3U;
 constexpr std::uint8_t oldest_readable_version = 1U;
 constexpr std::uint64_t file_header_size = 24U;
 constexpr std::uint64_t block_header_size = 24U;
@@ -42,12 +42,17 @@ constexpr std::uint64_t stream_lzp_limit = 512ULL * 1024U * 1024U;
 constexpr unsigned int stream_hash_bits_floor = 20U;
 constexpr unsigned int stream_hash_bits_ceiling = 26U;
 
-constexpr std::uint64_t auto_block_floor = 4ULL * 1024U * 1024U;
-constexpr std::uint64_t auto_block_ceiling = 16ULL * 1024U * 1024U;
-constexpr std::uint64_t auto_block_divisor = 16U;
+// Blocks of 16 MiB unless asked otherwise: inputs up to that size are coded whole, since
+// splitting them costs several percent, and larger ones split into enough blocks for a
+// thread pool at a bounded memory cost per block.
+constexpr std::uint64_t auto_block_size = 16ULL * 1024U * 1024U;
 
-// An in-flight block costs roughly 15x its size in scratch.
-constexpr std::uint64_t pipeline_byte_budget = 128ULL * 1024U * 1024U;
+// An in-flight block costs roughly 15x its size in sort scratch plus a fixed amount for the
+// context-mixing model; the number of blocks in flight is bounded so that the total stays
+// around two gigabytes at worst.
+constexpr std::uint64_t pipeline_memory_budget = 1920ULL * 1024U * 1024U;
+constexpr std::uint64_t block_scratch_factor = 15U;
+constexpr std::uint64_t model_memory_bytes = 32ULL * 1024U * 1024U;
 constexpr std::uint32_t maximum_thread_count = 256U;
 constexpr std::uint32_t unique_path_attempts = 10'000U;
 
@@ -58,13 +63,28 @@ enum class BlockMode : std::uint8_t
     mixed = 2
 };
 
-// Bit 0 of the block flags: the block bytes went through LZP before the BWT.
+// Bit 0 of the block flags: the block bytes went through LZP before the BWT. Bit 1: the x86
+// branch-target filter ran first (version 3 archives only). Both only combine with the mixer.
 constexpr Byte block_flag_lzp = 0x01U;
+constexpr Byte block_flag_x86 = 0x02U;
+// The x86 candidate is only tried when the filter finds at least one in-block branch target
+// per this many bytes: x86 code has one every 40-70 bytes, while data with incidental E8/E9
+// bytes (and non-x86 code) stays above 1,000 and never gains from the filter.
+constexpr std::size_t x86_bytes_per_target = 1024;
+// Dense machine code (one target per this many bytes or fewer) always does better filtered,
+// so the unfiltered mixer candidates are skipped there unless the encoder is thorough.
+constexpr std::size_t x86_dense_bytes_per_target = 256;
+// The per-block LZP candidate is only built when the pass shrinks the block by at least this
+// fraction; a smaller shrink has never paid for the second sort and mix in measurements.
+constexpr std::size_t lzp_shrink_divisor = 256;
 
 struct BlockHeader
 {
     BlockMode mode = BlockMode::raw;
     bool lzp = false;
+    bool x86 = false;
+    // Archive version the block was read from; selects the context-mixing model.
+    std::uint8_t version = archive_version;
     std::uint32_t original_size = 0;
     std::uint32_t payload_size = 0;
     std::uint32_t primary_index = 0;
@@ -314,7 +334,8 @@ void write_file_header(std::ostream& output, const std::uint32_t block_size,
 void write_block_header(std::ostream& output, const BlockHeader& header)
 {
     write_byte(output, static_cast<Byte>(header.mode));
-    write_byte(output, header.lzp ? block_flag_lzp : Byte{0U});
+    write_byte(output, static_cast<Byte>((header.lzp ? block_flag_lzp : Byte{0U}) |
+                                         (header.x86 ? block_flag_x86 : Byte{0U})));
     write_u16(output, 0U);
     write_u32(output, header.original_size);
     write_u32(output, header.payload_size);
@@ -330,7 +351,9 @@ void write_block_header(std::ostream& output, const BlockHeader& header)
     const std::uint16_t reserved_word = read_u16(input, "block flags");
     const Byte mode_limit = version >= 2U ? static_cast<Byte>(BlockMode::mixed)
                                           : static_cast<Byte>(BlockMode::transformed);
-    const Byte flag_limit = version >= 2U ? block_flag_lzp : Byte{0U};
+    const Byte flag_limit = version >= 3U   ? static_cast<Byte>(block_flag_lzp | block_flag_x86)
+                            : version >= 2U ? block_flag_lzp
+                                            : Byte{0U};
     if ((flags & static_cast<Byte>(~flag_limit)) != 0U || reserved_word != 0U)
     {
         throw FormatError("unsupported block flags");
@@ -341,8 +364,10 @@ void write_block_header(std::ostream& output, const BlockHeader& header)
     }
 
     BlockHeader header;
+    header.version = version;
     header.mode = static_cast<BlockMode>(mode_value);
     header.lzp = (flags & block_flag_lzp) != 0U;
+    header.x86 = (flags & block_flag_x86) != 0U;
     header.original_size = read_u32(input, "block size");
     header.payload_size = read_u32(input, "payload size");
     header.primary_index = read_u32(input, "BWT index");
@@ -378,8 +403,7 @@ void write_block_header(std::ostream& output, const BlockHeader& header)
         return static_cast<std::uint32_t>(
             std::clamp<std::uint64_t>(input_size, minimum_block_size, maximum_block_size));
     }
-    return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
-        input_size / auto_block_divisor, auto_block_floor, auto_block_ceiling));
+    return static_cast<std::uint32_t>(auto_block_size);
 }
 
 void validate_block_size(const std::uint32_t block_size)
@@ -424,6 +448,15 @@ void increment_mode_count(CompressionStats& stats, const BlockMode mode)
         ++bits;
     }
     return bits;
+}
+
+// How many blocks of `block_size` may be in flight at once within the memory budget.
+[[nodiscard]] std::size_t pipeline_window(const std::uint32_t block_size,
+                                          const std::uint32_t thread_count) noexcept
+{
+    const std::uint64_t per_block = block_scratch_factor * block_size + model_memory_bytes;
+    return static_cast<std::size_t>(
+        std::clamp<std::uint64_t>(pipeline_memory_budget / per_block, 1U, thread_count));
 }
 
 struct EncodedBlock
@@ -479,32 +512,70 @@ struct BlockCandidate
     return candidate;
 }
 
-[[nodiscard]] EncodedBlock encode_block(Bytes original)
+// `thorough` builds every candidate regardless of the shortcut heuristics (the ratio profile).
+[[nodiscard]] EncodedBlock encode_block(Bytes original, const bool thorough)
 {
     EncodedBlock result;
     result.header.original_size = narrow_size(original.size(), "block size");
     result.header.payload_size = result.header.original_size;
     result.header.checksum = detail::adler32(original);
 
-    BlockCandidate best = encode_candidate(original, original.size());
-    std::uint32_t intermediate = best.context_mixed ? 0U : best.symbol_count;
-    bool lzp_used = false;
+    const std::uint64_t branch_targets = detail::x86_branch_targets(original);
+    const bool x86_candidate = branch_targets * x86_bytes_per_target >= original.size();
+    const bool x86_dense =
+        x86_candidate && branch_targets * x86_dense_bytes_per_target >= original.size();
 
-    const std::optional<Bytes> lzp =
-        detail::lzp_encode(original, stream_hash_bits(original.size()));
-    if (lzp)
+    BlockCandidate best;
+    std::uint32_t intermediate = 0;
+    bool lzp_used = false;
+    bool x86_used = false;
+    if (thorough || !x86_dense)
+    {
+        best = encode_candidate(original, original.size());
+        intermediate = best.context_mixed ? 0U : best.symbol_count;
+    }
+
+    // Context-mixes one more pre-transformed stream and keeps it when it beats the best so far.
+    const auto try_mixed = [&](const Bytes& stream, const bool lzp, const bool x86)
     {
         const std::size_t limit =
             best.payload ? std::min(original.size(), best.payload->size()) : original.size();
-        detail::BwtResult bwt = detail::bwt_encode(*lzp);
+        detail::BwtResult bwt = detail::bwt_encode(stream);
         std::optional<Bytes> mixed = detail::cm_encode(bwt.data, limit);
         if (mixed && (!best.payload || mixed->size() < best.payload->size()))
         {
             best.payload = std::move(mixed);
             best.primary_index = bwt.primary_index;
             best.context_mixed = true;
-            intermediate = narrow_size(lzp->size(), "LZP intermediate stream");
-            lzp_used = true;
+            intermediate = lzp ? narrow_size(stream.size(), "LZP intermediate stream") : 0U;
+            lzp_used = lzp;
+            x86_used = x86;
+        }
+    };
+
+    const auto worth_trying = [&](const std::optional<Bytes>& lzp)
+    {
+        return lzp &&
+               (thorough || lzp->size() <= original.size() - original.size() / lzp_shrink_divisor);
+    };
+    const unsigned int hash_bits = stream_hash_bits(original.size());
+    if (thorough || !x86_dense)
+    {
+        if (const std::optional<Bytes> lzp = detail::lzp_encode(original, hash_bits);
+            worth_trying(lzp))
+        {
+            try_mixed(*lzp, true, false);
+        }
+    }
+    if (x86_candidate)
+    {
+        Bytes filtered = original;
+        static_cast<void>(detail::x86_filter_encode(filtered));
+        try_mixed(filtered, false, true);
+        if (const std::optional<Bytes> lzp = detail::lzp_encode(filtered, hash_bits);
+            worth_trying(lzp))
+        {
+            try_mixed(*lzp, true, true);
         }
     }
 
@@ -512,6 +583,7 @@ struct BlockCandidate
     {
         result.header.mode = best.context_mixed ? BlockMode::mixed : BlockMode::transformed;
         result.header.lzp = lzp_used;
+        result.header.x86 = x86_used;
         result.header.payload_size = narrow_size(best.payload->size(), "block payload");
         result.header.primary_index = best.primary_index;
         result.header.intermediate_size = intermediate;
@@ -542,7 +614,7 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
     {
     case BlockMode::raw:
         if (header.payload_size != header.original_size || header.primary_index != 0U ||
-            header.intermediate_size != 0U || header.lzp)
+            header.intermediate_size != 0U || header.lzp || header.x86)
         {
             throw FormatError("raw block contains transform metadata");
         }
@@ -554,7 +626,7 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
         // Run symbols consume at least one MTF byte each.
         if (header.primary_index == 0U || header.primary_index > header.original_size ||
             header.intermediate_size == 0U || header.intermediate_size > header.original_size ||
-            header.lzp)
+            header.lzp || header.x86)
         {
             throw FormatError("invalid transformed block metadata");
         }
@@ -576,13 +648,18 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
         {
             throw FormatError("invalid mixed block metadata");
         }
-        Bytes coded = detail::cm_decode(payload, coded_size);
+        Bytes coded = header.version >= 3U ? detail::cm_decode(payload, coded_size)
+                                           : detail::cm_decode_v2(payload, coded_size);
         payload = Bytes();
         Bytes stream = detail::bwt_decode(coded, header.primary_index);
         coded = Bytes();
         decoded = header.lzp ? detail::lzp_decode(stream, header.original_size,
                                                   stream_hash_bits(header.original_size))
                              : std::move(stream);
+        if (header.x86)
+        {
+            detail::x86_filter_decode(decoded);
+        }
         break;
     }
     }
@@ -614,8 +691,10 @@ void write_encoded_block(std::ostream& output, const EncodedBlock& block, Compre
 }
 
 // Same ordered window pipeline as the streaming path, over an in-memory stream.
-[[nodiscard]] std::vector<EncodedBlock>
-encode_buffered(const Bytes& data, const std::uint32_t block_size, const std::uint32_t thread_count)
+[[nodiscard]] std::vector<EncodedBlock> encode_buffered(const Bytes& data,
+                                                        const std::uint32_t block_size,
+                                                        const std::uint32_t thread_count,
+                                                        const bool thorough)
 {
     const std::uint32_t block_count = expected_block_count(data.size(), block_size);
     std::vector<EncodedBlock> encoded;
@@ -628,13 +707,12 @@ encode_buffered(const Bytes& data, const std::uint32_t block_size, const std::ui
                      data.begin() + static_cast<std::ptrdiff_t>(end));
     };
 
-    const std::size_t window = static_cast<std::size_t>(
-        std::clamp<std::uint64_t>(pipeline_byte_budget / block_size, 1U, thread_count));
+    const std::size_t window = pipeline_window(block_size, thread_count);
     if (window <= 1U || block_count <= 1U)
     {
         for (std::uint32_t index = 0; index < block_count; ++index)
         {
-            encoded.push_back(encode_block(slice(index)));
+            encoded.push_back(encode_block(slice(index), thorough));
         }
         return encoded;
     }
@@ -661,8 +739,9 @@ encode_buffered(const Bytes& data, const std::uint32_t block_size, const std::ui
             {
                 drain_front();
             }
-            std::packaged_task<EncodedBlock()> task([block = slice(index)]() mutable
-                                                    { return encode_block(std::move(block)); });
+            std::packaged_task<EncodedBlock()> task(
+                [block = slice(index), thorough]() mutable
+                { return encode_block(std::move(block), thorough); });
             in_flight.emplace_back();
             InFlightBlock& slot = in_flight.back();
             slot.result = task.get_future();
@@ -808,6 +887,7 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
     }
 
     const std::uint32_t thread_count = effective_thread_count(options.thread_count);
+    const bool thorough = options.profile == Profile::ratio;
 
     // A decisive shrink commits to the LZP stream; a marginal one compares both archives.
     bool stream_lzp = false;
@@ -823,13 +903,13 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
         {
             buffer = std::move(*collapsed);
             stream_lzp = true;
-            encoded = encode_buffered(buffer, block_size, thread_count);
+            encoded = encode_buffered(buffer, block_size, thread_count, thorough);
         }
         else if (collapsed)
         {
             std::vector<EncodedBlock> with_pass =
-                encode_buffered(*collapsed, block_size, thread_count);
-            encoded = encode_buffered(buffer, block_size, thread_count);
+                encode_buffered(*collapsed, block_size, thread_count, thorough);
+            encoded = encode_buffered(buffer, block_size, thread_count, thorough);
             if (encoded_archive_size(with_pass) + stream_header_size <
                 encoded_archive_size(encoded))
             {
@@ -840,7 +920,7 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
         }
         else
         {
-            encoded = encode_buffered(buffer, block_size, thread_count);
+            encoded = encode_buffered(buffer, block_size, thread_count, thorough);
         }
     }
 
@@ -914,15 +994,14 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
             remaining -= current_size;
         };
 
-        const std::size_t window = static_cast<std::size_t>(
-            std::clamp<std::uint64_t>(pipeline_byte_budget / block_size, 1U, thread_count));
+        const std::size_t window = pipeline_window(block_size, thread_count);
         if (window <= 1U || block_count <= 1U)
         {
             for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
             {
                 Bytes original;
                 read_block(original);
-                write_encoded_block(output, encode_block(std::move(original)), stats);
+                write_encoded_block(output, encode_block(std::move(original), thorough), stats);
             }
         }
         else
@@ -954,8 +1033,8 @@ CompressionStats compress_file(const std::filesystem::path& input_path,
                     Bytes original;
                     read_block(original);
                     std::packaged_task<EncodedBlock()> task(
-                        [block = std::move(original)]() mutable
-                        { return encode_block(std::move(block)); });
+                        [block = std::move(original), thorough]() mutable
+                        { return encode_block(std::move(block), thorough); });
                     in_flight.emplace_back();
                     InFlightBlock& slot = in_flight.back();
                     slot.result = task.get_future();
@@ -1218,8 +1297,7 @@ CompressionStats decompress_file(const std::filesystem::path& input_path,
     try
     {
         const std::uint32_t thread_count = effective_thread_count(options.thread_count);
-        const std::size_t window = static_cast<std::size_t>(
-            std::clamp<std::uint64_t>(pipeline_byte_budget / block_size, 1U, thread_count));
+        const std::size_t window = pipeline_window(block_size, thread_count);
         if (window <= 1U || block_count <= 1U)
         {
             for (std::uint32_t block_index = 0; block_index < block_count; ++block_index)
