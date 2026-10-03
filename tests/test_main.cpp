@@ -4,6 +4,7 @@
 #include "transforms.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -108,10 +109,32 @@ private:
     return result;
 }
 
+// std::mt19937 produces the same sequence everywhere, but the standard distributions are
+// implemented differently by each standard library, so generated test data would differ
+// between platforms. This mapping of the generator's 32-bit output is the same everywhere.
+template <typename Int> class PortableUniform
+{
+public:
+    PortableUniform(const Int low, const Int high)
+        : low_(low), span_(static_cast<std::uint64_t>(high - low) + 1U)
+    {
+    }
+
+    template <typename Generator> [[nodiscard]] Int operator()(Generator& generator) const
+    {
+        const auto value = static_cast<std::uint64_t>(generator()) & 0xFFFFFFFFULL;
+        return static_cast<Int>(low_ + static_cast<Int>((value * span_) >> 32U));
+    }
+
+private:
+    Int low_;
+    std::uint64_t span_;
+};
+
 [[nodiscard]] Bytes random_bytes(const std::size_t size, const std::uint32_t seed)
 {
     std::mt19937 generator(seed);
-    std::uniform_int_distribution<unsigned int> distribution(0U, 255U);
+    PortableUniform<unsigned int> distribution(0U, 255U);
     Bytes result(size);
     for (Byte& value : result)
     {
@@ -226,13 +249,13 @@ void test_bwt_randomized()
     std::mt19937 generator(20260722U);
     for (unsigned int round = 0; round < 200U; ++round)
     {
-        std::uniform_int_distribution<std::size_t> size_distribution(0U, 300U);
-        std::uniform_int_distribution<unsigned int> alphabet_distribution(1U, 4U);
+        PortableUniform<std::size_t> size_distribution(0U, 300U);
+        PortableUniform<unsigned int> alphabet_distribution(1U, 4U);
         const std::size_t size = size_distribution(generator);
         const unsigned int alphabet = 1U << alphabet_distribution(generator);
 
         Bytes input(size);
-        std::uniform_int_distribution<unsigned int> value_distribution(0U, alphabet - 1U);
+        PortableUniform<unsigned int> value_distribution(0U, alphabet - 1U);
         for (Byte& value : input)
         {
             value = static_cast<Byte>(value_distribution(generator));
@@ -307,7 +330,7 @@ void test_bwt_matches_naive_sort()
     {
         for (const std::size_t period : {std::size_t{0}, std::size_t{13}, std::size_t{700}})
         {
-            std::uniform_int_distribution<unsigned int> value_distribution(0U, alphabet - 1U);
+            PortableUniform<unsigned int> value_distribution(0U, alphabet - 1U);
             Bytes input(4'000U);
             for (std::size_t index = 0; index < input.size(); ++index)
             {
@@ -354,9 +377,9 @@ void test_cm_and_lzp_round_trip()
     }
 
     std::mt19937 generator(20260723U);
-    std::uniform_int_distribution<std::size_t> size_distribution(0U, 2'000U);
-    std::uniform_int_distribution<unsigned int> byte_distribution(0U, 255U);
-    std::uniform_int_distribution<std::size_t> run_distribution(1U, 200U);
+    PortableUniform<std::size_t> size_distribution(0U, 2'000U);
+    PortableUniform<unsigned int> byte_distribution(0U, 255U);
+    PortableUniform<std::size_t> run_distribution(1U, 200U);
     for (unsigned int round = 0; round < 300U; ++round)
     {
         Bytes input(size_distribution(generator));
@@ -444,10 +467,10 @@ void test_cm_and_lzp_round_trip()
 [[nodiscard]] Bytes synthetic_x86(const std::size_t size, const std::uint32_t seed)
 {
     std::mt19937 generator(seed);
-    std::uniform_int_distribution<unsigned int> byte_distribution(0U, 255U);
-    std::uniform_int_distribution<std::size_t> gap_distribution(3U, 14U);
-    std::uniform_int_distribution<unsigned int> target_distribution(0U, 7U);
-    std::uniform_int_distribution<unsigned int> kind_distribution(0U, 15U);
+    PortableUniform<unsigned int> byte_distribution(0U, 255U);
+    PortableUniform<std::size_t> gap_distribution(3U, 14U);
+    PortableUniform<unsigned int> target_distribution(0U, 7U);
+    PortableUniform<unsigned int> kind_distribution(0U, 15U);
     Bytes program(size);
     for (Byte& value : program)
     {
@@ -504,8 +527,8 @@ void test_x86_filter_round_trip()
 
     // Dense random streams exercise opcodes inside operands and every boundary.
     std::mt19937 generator(20260801U);
-    std::uniform_int_distribution<std::size_t> size_distribution(0U, 3'000U);
-    std::uniform_int_distribution<unsigned int> byte_distribution(0U, 255U);
+    PortableUniform<std::size_t> size_distribution(0U, 3'000U);
+    PortableUniform<unsigned int> byte_distribution(0U, 255U);
     for (unsigned int round = 0; round < 300U; ++round)
     {
         Bytes input(size_distribution(generator));
@@ -627,9 +650,9 @@ void test_x86_flag_in_archives()
                                       const std::uint32_t seed)
 {
     std::mt19937 generator(seed);
-    std::uniform_int_distribution<unsigned int> step_distribution(0U, 40U);
-    std::uniform_int_distribution<unsigned int> drift_distribution(0U, 8U);
-    std::uniform_int_distribution<unsigned int> filler_distribution(0U, 3U);
+    PortableUniform<unsigned int> step_distribution(0U, 40U);
+    PortableUniform<unsigned int> drift_distribution(0U, 8U);
+    PortableUniform<unsigned int> filler_distribution(0U, 3U);
     Bytes table(count * stride);
     std::uint32_t counter = 1'000U;
     std::uint32_t level = 30'000U;
@@ -658,8 +681,8 @@ void test_x86_flag_in_archives()
                                     const std::uint32_t seed)
 {
     std::mt19937 generator(seed);
-    std::uniform_int_distribution<unsigned int> start_distribution(1'000U, 3'000U);
-    std::uniform_int_distribution<unsigned int> step_distribution(0U, 80U);
+    PortableUniform<unsigned int> start_distribution(1'000U, 3'000U);
+    PortableUniform<unsigned int> step_distribution(0U, 80U);
     std::vector<unsigned int> levels(width);
     for (unsigned int& level : levels)
     {
@@ -710,7 +733,7 @@ void test_record_filter_round_trip()
 
     // Every unit width, several strides and masks, tails of every length.
     std::mt19937 generator(20261002U);
-    std::uniform_int_distribution<unsigned int> byte_distribution(0U, 255U);
+    PortableUniform<unsigned int> byte_distribution(0U, 255U);
     for (const std::uint32_t unit : {1U, 2U, 4U, 8U})
     {
         // Whole units, and a shorter last unit when the unit does not divide the stride.
@@ -908,7 +931,7 @@ void test_record_flag_in_archives()
     constexpr std::array<std::string_view, 8> backward{"ahpla ", "ateb ", "ammag ", "atled ",
                                                        "kcolb ", "tros ", "ledom ", "rexim\n"};
     std::mt19937 generator(seed);
-    std::uniform_int_distribution<std::size_t> word_distribution(0U, forward.size() - 1U);
+    PortableUniform<std::size_t> word_distribution(0U, forward.size() - 1U);
     Bytes data;
     for (const auto* words : {&forward, &backward, &forward})
     {
@@ -1176,7 +1199,7 @@ void test_stream_codec_round_trip()
 
     Bytes dna;
     std::mt19937 dna_generator(11U);
-    std::uniform_int_distribution<unsigned int> base(1U, 4U);
+    PortableUniform<unsigned int> base(1U, 4U);
     for (unsigned int index = 0; index < 20'000U; ++index)
     {
         dna.push_back(static_cast<Byte>(base(dna_generator)));
@@ -1376,8 +1399,8 @@ void test_random_corruption_is_rejected_safely()
 
     // Damage must produce FormatError or the exact original, never a crash.
     std::mt19937 generator(20260722U);
-    std::uniform_int_distribution<std::size_t> position_distribution(0U, valid.size() - 1U);
-    std::uniform_int_distribution<unsigned int> bit_distribution(0U, 7U);
+    PortableUniform<std::size_t> position_distribution(0U, valid.size() - 1U);
+    PortableUniform<unsigned int> bit_distribution(0U, 7U);
     const auto restored = directory.file("restored.bin");
     for (unsigned int round = 0; round < 300U; ++round)
     {
