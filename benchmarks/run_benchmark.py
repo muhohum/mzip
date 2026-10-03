@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Download standard corpora and benchmark mzip against gzip, bzip2, and xz."""
+"""Download standard corpora and benchmark mzip against gzip, bzip2, and xz.
+
+`--corpus canterbury` (default) fetches the Canterbury, Artificial, and Large corpora from
+corpus.canterbury.ac.nz; `--corpus silesia` fetches the Silesia corpus from its GitHub mirror
+(one zip per file). Every extracted file is checked against its pinned size and, where
+pinned, its SHA-256.
+"""
 
 from __future__ import annotations
 
@@ -48,6 +54,47 @@ FILES = (
     ("E.coli", "DNA sequence", 4_638_690, "large.zip"),
 )
 
+# The Silesia corpus (https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia) as mirrored on
+# GitHub; the hashes are those of the unzipped files, so a re-zipped mirror still verifies.
+SILESIA_URL = "https://raw.githubusercontent.com/MiloszKrajewski/SilesiaCorpus/master/{}.zip"
+SILESIA_FILES = (
+    ("dickens", "English text", 10_192_446,
+     "b24c37886142e11d0ee687db6ab06f936207aa7f2ea1fd1d9a36763c7a507e6a"),
+    ("mozilla", "executables tar (Alpha)", 51_220_480,
+     "657fc3764b0c75ac9de9623125705831ebbfbe08fed248df73bc2dc66e2a963b"),
+    ("mr", "MRI image", 9_970_564,
+     "68637ed52e3e4860174ed2dc0840ac77d5f1a60abbcb13770d5754e3774d53e6"),
+    ("nci", "chemical database", 33_553_445,
+     "fc63a31770947b8c2062d3b19ca94c00485a232bb91b502021948fee983e1635"),
+    ("ooffice", "x86 executable", 6_152_192,
+     "e7ee013880d34dd5208283d0d3d91b07f442e067454276095ded14f322a656eb"),
+    ("osdb", "database", 10_085_684,
+     "60f027179302ca3ad87c58ac90b6be72ec23588aaa7a3b7fe8ecc0f11def3fa3"),
+    ("reymont", "Polish text", 6_627_202,
+     "0eac0114a3dfe6e2ee1f345a0f79d653cb26c3bc9f0ed79238af4933422b7578"),
+    ("samba", "source tar", 21_606_400,
+     "93ba07bc44d8267789c1d911992f40b089ffa2140b4a160fac11ccae9a40e7b2"),
+    ("sao", "star catalog", 7_251_944,
+     "c2d0ea2cc59d4c21b7fe43a71499342a00cbe530a1d5548770e91ecd6214adcc"),
+    ("webster", "dictionary", 41_458_703,
+     "6a68f69b26daf09f9dd84f7470368553194a0b294fcfa80f1604efb11143a383"),
+    ("x-ray", "X-ray image", 8_474_240,
+     "7de9fce1405dc44ae5e6813ed21cd5751e761bd4265655a005d39b9685d1c9ad"),
+    ("xml", "XML", 5_345_280,
+     "0e82e54e695c1938e4193448022543845b33020c8be6bf3bf3ead2224903e08c"),
+)
+
+# corpus -> (archives {name: (url, sha256 or None)}, files, pinned file hashes, description)
+CORPORA = {
+    "canterbury": (ARCHIVES, FILES, {}, "Canterbury, Artificial, and Large corpora"),
+    "silesia": (
+        {f"{name}.zip": (SILESIA_URL.format(name), None) for name, *_ in SILESIA_FILES},
+        tuple((name, kind, size, f"{name}.zip") for name, kind, size, _ in SILESIA_FILES),
+        {name: digest for name, _, _, digest in SILESIA_FILES},
+        "Silesia corpus",
+    ),
+}
+
 REFERENCE_CODECS = (
     ("gzip -9", lambda d: gzip.compress(d, compresslevel=9, mtime=0), gzip.decompress),
     ("bzip2 -9", lambda d: bz2.compress(d, compresslevel=9), bz2.decompress),
@@ -63,8 +110,9 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download(url: str, destination: Path, expected_hash: str) -> None:
-    if destination.exists() and sha256(destination) == expected_hash:
+def download(url: str, destination: Path, expected_hash: str | None) -> None:
+    """Fetch url unless destination is already there (and matches expected_hash, if any)."""
+    if destination.exists() and (expected_hash is None or sha256(destination) == expected_hash):
         return
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -74,7 +122,7 @@ def download(url: str, destination: Path, expected_hash: str) -> None:
         with urllib.request.urlopen(url, timeout=60) as response, temporary.open("wb") as output:
             shutil.copyfileobj(response, output)
         actual_hash = sha256(temporary)
-        if actual_hash != expected_hash:
+        if expected_hash is not None and actual_hash != expected_hash:
             raise RuntimeError(
                 f"SHA-256 mismatch for {destination.name}: expected {expected_hash}, got {actual_hash}"
             )
@@ -83,14 +131,15 @@ def download(url: str, destination: Path, expected_hash: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def prepare_corpus(data_directory: Path) -> dict[str, Path]:
-    for archive_name, (url, expected_hash) in ARCHIVES.items():
+def prepare_corpus(data_directory: Path, corpus: str) -> dict[str, Path]:
+    archives, files, file_hashes, _description = CORPORA[corpus]
+    for archive_name, (url, expected_hash) in archives.items():
         download(url, data_directory / archive_name, expected_hash)
 
     extracted = data_directory / "files"
     extracted.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
-    for name, _kind, expected_size, archive_name in FILES:
+    for name, _kind, expected_size, archive_name in files:
         destination = extracted / name
         with zipfile.ZipFile(data_directory / archive_name) as archive:
             if name not in archive.namelist():
@@ -99,6 +148,8 @@ def prepare_corpus(data_directory: Path) -> dict[str, Path]:
                 shutil.copyfileobj(source, output)
         if destination.stat().st_size != expected_size:
             raise RuntimeError(f"unexpected size for {name}")
+        if name in file_hashes and sha256(destination) != file_hashes[name]:
+            raise RuntimeError(f"SHA-256 mismatch for {name}")
         paths[name] = destination
     return paths
 
@@ -125,8 +176,9 @@ def time_callable(action, repeat: int):
     return statistics.median(timings), result
 
 
-def benchmark(binary: Path, data_directory: Path, repeat: int, threads: int | None):
-    corpus = prepare_corpus(data_directory)
+def benchmark(binary: Path, data_directory: Path, repeat: int, threads: int | None,
+              corpus_name: str):
+    corpus = prepare_corpus(data_directory, corpus_name)
     rows: list[dict[str, object]] = []
     reference_totals = {
         name: {"size": 0, "compress": 0.0, "decompress": 0.0} for name, _c, _d in REFERENCE_CODECS
@@ -138,7 +190,7 @@ def benchmark(binary: Path, data_directory: Path, repeat: int, threads: int | No
     thread_arguments = [] if threads is None else ["--threads", str(threads)]
     with tempfile.TemporaryDirectory(prefix="mzip-benchmark-", dir=work_parent) as temporary:
         work = Path(temporary)
-        for name, kind, expected_size, _archive_name in FILES:
+        for name, kind, expected_size, _archive_name in CORPORA[corpus_name][1]:
             source = corpus[name]
             archive = work / f"{name}.mz"
             restored = work / f"{name}.restored"
@@ -205,7 +257,7 @@ def render_table(headers: list[str], rows: list[list[str]], numeric_from: int) -
     return [render_row(headers), separator] + [render_row(row) for row in rows]
 
 
-def format_report(rows, mzip_total, reference_totals, repeat, binary, threads) -> str:
+def format_report(rows, mzip_total, reference_totals, repeat, binary, threads, corpus) -> str:
     total_input = sum(int(row["input_size"]) for row in rows)
     thread_note = "all cores" if threads is None else str(threads)
 
@@ -276,7 +328,7 @@ def format_report(rows, mzip_total, reference_totals, repeat, binary, threads) -
         f"- Timing: median of {repeat} run(s); mzip numbers include process start and file I/O,",
         "  reference codecs run in memory through Python's C modules",
         f"- Compression threads: {thread_note}",
-        "- Corpus: Canterbury, Artificial, and Large corpora",
+        f"- Corpus: {CORPORA[corpus][3]}",
         "",
         "## Summary",
         "",
@@ -303,7 +355,10 @@ def parse_arguments() -> argparse.Namespace:
         "--data-dir",
         type=Path,
         default=project_root / "build" / "benchmark-data",
-        help="download/cache directory",
+        help="download/cache directory (Silesia goes to its silesia/ subdirectory)",
+    )
+    parser.add_argument(
+        "--corpus", choices=sorted(CORPORA), default="canterbury", help="corpus to benchmark"
     )
     parser.add_argument("--repeat", type=int, default=3, help="number of timed round-trips")
     parser.add_argument(
@@ -323,11 +378,15 @@ def main() -> int:
     if not binary.is_file():
         raise FileNotFoundError(f"mzip executable not found: {binary}")
 
+    data_directory = arguments.data_dir.resolve()
+    if arguments.corpus != "canterbury":
+        data_directory /= arguments.corpus
     rows, mzip_total, reference_totals = benchmark(
-        binary, arguments.data_dir.resolve(), arguments.repeat, arguments.threads
+        binary, data_directory, arguments.repeat, arguments.threads, arguments.corpus
     )
     report = format_report(
-        rows, mzip_total, reference_totals, arguments.repeat, binary, arguments.threads
+        rows, mzip_total, reference_totals, arguments.repeat, binary, arguments.threads,
+        arguments.corpus,
     )
     if arguments.output:
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
